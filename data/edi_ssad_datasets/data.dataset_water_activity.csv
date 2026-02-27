@@ -1,0 +1,3 @@
+"dataset_water_activity_pkey","water_activity_measured","Prairie_Biomass","Miscanthus","Switchgrass","Corn_Stover","Beef_Manure","Inoculum_Sludge"
+1,"Before",0.195666666666667,0.309,0.265666666666667,0.361333333333333,0.841333333333333,0.912666666666667
+2,"After",0.743666666666667,0.633333333333333,0.535666666666667,0.45,NA,NA

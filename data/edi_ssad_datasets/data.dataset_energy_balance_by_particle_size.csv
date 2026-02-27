@@ -1,0 +1,5 @@
+"dataset_energy_balance_by_particle_size_pkey","energy_output_or_input","one_inch","one_quarter_inch","two_mm"
+1,"Methane Production (mL/ gVS)","231.4± 66.0","268.1± 42.0","260.9± 46.7"
+2,"Energy Produced from Methane (kJ/ kg DM)","7973.2","9239.7999999999993","8991.7000000000007"
+3,"Milling Consumption (kJ/ kg DM)","23.5","114","424.7"
+4,"Net Energy (-Heating and Pumping) (kJ/ kg DM)","7949.7","9125.7999999999993","8567"

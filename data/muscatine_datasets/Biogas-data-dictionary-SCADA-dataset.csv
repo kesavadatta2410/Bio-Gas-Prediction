@@ -1,0 +1,28 @@
+Element or value display name,Description,Unit,Data type,Acceptable values
+Timestamp,Date and time index of the form '%m/%d/%Y %H:%M',NA,string,Dates as string
+D1_TEMPERATURE,Temperature of digester 1,Degrees Farenheit,float,85-150
+D2_TEMPERATURE,Temperature of digester 2,Degrees Farenheit,float,85-150
+Q-PS_MGD,Primary Sludge Flow,Million gallons per day,float,0-500
+Q-influent_MGD,Plant influent flow,Million gallons per day,float,0-32.5
+Q-TWAS_GPM,Flow of thickened waste activated sludge to digesters,Gallons per minute,float,0-250
+Q-Aeration_SCFM,Total flow of air to aeration basins,Standard cubic feet per hour,float,0-20000
+RAS-1-GATE_MGD,Recycled activated sludge flow control gates 1,Million gallons per day,float,0-4
+RAS-2-GATE_MGD,Recycled activated sludge flow control gates 2,Million gallons per day,float,0-4
+RAS-3-GATE_MGD,Recycled activated sludge flow control gates 3,Million gallons per day,float,0-4
+Q-RAS1_MGD,"Flow of recycled activated sludge, pump 1",Million gallons per day,float,0-6.74
+Q-RAS2_MGD,"Flow of recycled activated sludge, pump 2",Million gallons per day,float,0-6.74
+Q-RAS3_MGD,"Flow of recycled activated sludge, pump 3",Million gallons per day,float,0-6.74
+Q-WAS1_MGD,"Flow of waste activated sludge, pump 1",Million gallons per day,float,0-0.5
+Q-WAS2_MGD,"Flow of waste activated sludge, pump 1",Million gallons per day,float,0-0.5
+V-burner_FT3,"Volume of biogas to waste gas burner, total today",Cubic feet,float,0-100000
+V-Boiler_FT3,"Volume of biogas to waste gas boiler, total today",Cubic feet,float,0-100000
+Q-HSW1_GPM,Flow of high strength waste to digester 1,Gallons per minute,float,0-100
+Q-HSW2_GPM,Flow of high strength waste to digester 2,Gallons per minute,float,0-100
+V-HSW-DIG2-yest_gal,High strength waste added to digester 2 yesterday,Gallons,float,0-100000
+H-HSW_ft,Height of liquid surface in high strength waste tank,Feet,float,0-14
+Q-RAS_MGD,Total recycled activated sludge flow,Million gallons per day,float,0-12
+H-Dig1_FT,Digester 1 lid height,Feet,float,0-12
+H-Dig2_FT,Digester 2 lid height,Feet,float,0-12
+Biogas,Total biogas flow (sum of Biogas_burner and Biogas_boiler),Cubic feet per minute,float,0-1120
+Biogas_burner,Digester Gas Flow Rate to Waste Gas Burner,Cubic feet per minute,float,0-1000
+Biogas_boiler,Digester Gas Flow Rate to Boiler,Cubic feet per minute,float,0-120

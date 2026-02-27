@@ -1,0 +1,15 @@
+"dataset_chemical_compositions_pkey","parameter","prairie_biomass","beef_manure","anaerobic_sludge"
+1,"Total Solids %",98.1,19.73,0.15
+2,"Volatile Solids %",92.9,83.29,82.11
+3,"Total Carbon %",44.54,41.83,NA
+4,"Total Nitrogen %",0.472,1.64,NA
+5,"Total Oxygen %",49.76,51.43,NA
+6,"Total Sulfur %",0.017,0.016,NA
+7,"Total Hydrogen %",44.54,41.83,NA
+8,"C/N Ratio",94.36,25.5,NA
+9,"pH",NA,8.23,7.59
+10,"Cellulose %",33.32,22.01,NA
+11,"Hemicellulose %",26.46,18.24,NA
+12,"Lignin %",17.62,29.96,NA
+13,"Cellulosic Content (Dry Ash-Free Basis)",82.79,80.91,NA
+14,"Initial Water Activity (aw)",0.44,0.841,0.913

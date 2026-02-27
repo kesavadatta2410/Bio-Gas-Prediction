@@ -1,0 +1,223 @@
+\name{sensor_ad}
+\alias{sensor_ad}
+
+\docType{data}
+\title{Anaerobic Digester Data}
+\description{
+\code{sensor_ad} is a dataset containing the data from two separate studies: a pilot study spanning 2019-2020 and a full-scale study spanning 2021-2022. The studies are comprised of 1) data collected daily from an anaerobic digester facility and 2) carbon consumption rate (CCR) data taken every minute by bioelectric sensors and averaged daily. The sensors detect volatile (fatty) acids, thus providing a measurement of biological activity.
+
+The pilot study has two digesters and three CCR sensors, while the full-scale study has one digester and two CCR sensors. A diagram of the two processes is shown in the Source section of this document. In the pilot study, microorganisms are fed daily, and fats, oils, and grease (FOG) values are higher than in the full-scale study. In the full-scale study, microorganisms are fed continuously, and the facility is more conservative with FOG. Higher amounts of FOG result in more biogas generation; however, too much FOG in the feed can cause system failure. The goal of this study is to evaluate the 
+relationships between biogas and wastes, such
+as FOG and food waste (FW), in order to find
+the optimal levels of waste that provide
+maximum biogas production and prevent
+system imbalances.
+}
+\usage{
+data(sensor_ad)
+}
+\format{
+  A list of three data frames. \code{sensor_ad$pilot_merged} contains data from the pilot scale study, while \code{sensor_ad$full_scale_digester_ccr} and \code{sensor_ad$full_scale_wwc_ccr} contain data from the full-scale study. The two data frames from the full scale study merge the CCR sensor data with either the digester data (\code{sensor_ad$full_scale_digester_ccr}) or the wastewater composition data (\code{sensor_ad$full_scale_wwc_ccr}).  This was done to reduce the number of missing variables in each set.
+  
+  \strong{(1)} \code{sensor_ad$pilot_merged} is a data frame containing 309 rows and 73 columns of pilot study data. Initial analysis suggests that the 5 strongest predictors of biogas are \code{PD1_VS_pct}, \code{food_loading_rate_lb1000ft3xd}, \code{PD1_COD_mgl}, \code{PD1_alkalinity_mgl}, and \code{PD_organic_loading_rate_7dayavg_pct}.
+  
+  \describe{
+    \item{\code{datetime}}{The date at which an observation is recorded}
+    \item{\code{fog_total_solids_pct}}{Percentage of FOG total solids in liquid}
+    \item{\code{fog_VS_pct}}{Percentage of volatile solids in FOG total solids}
+    \item{\code{fog_total_volatile_acids_mgl}}{Amount of volatile acids in FOG (mg/l)}
+    \item{\code{fog_chemical_oxygen_demand_mgl}}{FOG chemical oxygen demand (mg/l)}
+    \item{\code{food_total_solids_pct}}{Percentage of total solids in external organic food waste}
+    \item{\code{PS_total_solids_avg_pct}}{Percentage of primary sludge solids in liquid}
+    \item{\code{food_VS_pct}}{Percentage of volatile solids in food total solids}
+    \item{\code{food_total_volatile_acids_mgl}}{Amount of volatile acids in food (mg/l)}
+    \item{\code{food_chemical_oxygen_demand_mgl}}{Food COD (mg/l)}
+    \item{\code{PS_volatile_acids_mgl}}{Amount of volatile acids in primary sludge (mg/l)}
+    \item{\code{PS_soluble_chemical_oxygen_demand_mgl}}{Soluble COD in primary sludge (mg/l)}
+    \item{\code{TWAS_total_solids_pct}}{Percentage of thickened waste activated sludge (TWAS) solids in liquid}
+    \item{\code{TWAS_total_volatile_acids_mgl}}{Volatile acids in TWAS (mg/l)}
+    \item{\code{TWAS_soluble_chemical_oxygen_demand_mgl}}{TWAS soluble chemical oxygen demand (COD) (mg/l)}
+    \item{\code{PD1_start_time_feed_hrs}}{Time digester 1 starts sending feed (hrs)}
+    \item{\code{PD1_total_hours_of_feed_hrs}}{Amount of time that digester 1 is sent food (hrs)}
+    \item{\code{PD2_stop_time_feed_hrs}}{Time digester 2 ends sending feed (hrs)}
+    \item{\code{PD1_alkalinity_mgl}}{Alkalinity amount in Digester 1 (mg/l)}
+    \item{\code{PD1_sCOD_mgl}}{Soluble chemical oxygen demand (sCOD) in Digester 1 (mg/l)}
+    \item{\code{PD1_VS_pct}}{Volatile solids percentage in Digester 1}
+    \item{\code{PD2_COD_mgl}}{Chemical oxygen demand in Digester 2 (mg/l)}
+    \item{\code{PD2_TS_pct}}{Total solids percentage in Digester 2}
+    \item{\code{fog_soluble_chemical_oxygen_demand_mgl}}{FOG sCOD (mg/l)}
+    \item{\code{food_soluble_chemical_oxygen_demand_mgl}}{Food sCOD (mg/l)}
+    \item{\code{PS_VS_avg_pct}}{Average volatile solid percentage in primary sludge}
+    \item{\code{PS_chemical_oxygen_demand_mgl}}{Primary sludge COD (mg/l)}
+    \item{\code{PS_total_alkalinity_mgl}}{Primary sludge total alkalinity (mg/l)}
+    \item{\code{comments_digester_1_ac}}{Comments on digester 1 data}
+    \item{\code{comments_digester_2_ac}}{Comments on digester 2 data}
+    \item{\code{TWAS_VS_pct}}{Percentage of volatile solids in TWAS}
+    \item{\code{TWAS_chemical_oxygen_demand_mgl}}{TWAS COD (mg/l)}
+    \item{\code{TWAS_total_alkalinity_mgl}}{Total alkilinity of TWAS}
+    \item{\code{PD1_stop_time_feed_hrs}}{Time feed ends sending to Digester 1 (hrs)}
+    \item{\code{PD2_start_time_feed_hrs}}{Time feed starts being sent to Digester 2 (hrs)}
+    \item{\code{PD2_total_hours_of_feed_hrs}}{Amount of time Digester 2 is sent food (hrs)}
+    \item{\code{PD1_volatile_acids_mgl}}{Volatile acids in Digester 1 (mg/l)}
+    \item{\code{PD1_ph_su}}{pH of Digester 1 (su)}
+    \item{\code{PD1_temperature_degf}}{Temperature of Digester 1 (ºF)}
+    \item{\code{PD1_gas_generation_cfday}}{Gas generation in Digester 1 (cf/day)}
+    \item{\code{PD1_gas_generation_cfhr}}{Gas generation in Digester 1 (cf/hour)}
+    \item{\code{PD1_COD_mgl}}{Chemical oxygen demand in Digester 1 (mg/l)}
+    \item{\code{PD1_TS_pct}}{Total solid percentage in Digester 1}
+    \item{\code{PD2_alkalinity_mgl}}{Alkalinity in Digester 2 (mg/l)}
+    \item{\code{PD2_sCOD_mgl}}{soluble COD in Digester 2 (mg/l)}
+    \item{\code{PD2_VS_pct}}{Digester 2 volatile solids (\%)}
+    \item{\code{PD2_volatile_acids_mgl}}{Digester 2 volatile acids (mg/l)}
+    \item{\code{PD2_ph_su}}{Digester 2 pH (su)}
+    \item{\code{PD2_temperature_degf}}{Digester 2 temperature (ºF)}
+    \item{\code{PD2_gas_generation_cfday}}{Digester 2 gas generation (cf/day)}
+    \item{\code{PD2_gas_generation_cfhr}}{Digester 2 gas generation (cf/hour)}
+    \item{\code{fog_feed_volume_gal}}{FOG feed volume (gal)}
+    \item{\code{fog_loading_rate_lb1000ft3xd}}{FOG loading rate (lb/1000ft3xd)}
+    \item{\code{food_feed_volume_gal}}{Food feed volume in (gal)}
+    \item{\code{food_loading_rate_lb1000ft3xd}}{Food loading rate (lb/1000ft3xd)}
+    \item{\code{PS_feed_volume_gal}}{Primary sludge feed volume (gal)}
+    \item{\code{PS_loading_rate_lb1000ft3xd}}{Primary sludge loading rate (lb/100ft3xd)}
+    \item{\code{TWAS_feed_volume_gal}}{TWAS feed volume (gal)}
+    \item{\code{TWAS_loading_rate_lb1000ft3xd}}{TWAS loading rate (lb/1000ft3xd)}
+    \item{\code{PD_target_organic_loading_rate_pct}}{Digester target organic loading rate (\%)}
+    \item{\code{PD_organic_loading_rate_pct}}{Digester actual organic loading rate (\%)}
+    \item{\code{PD_organic_loading_rate_7dayavg_pct}}{7-day average of digester organic loading rate (\%)}
+    \item{\code{PD1_volatile_solids_reduction_pct}}{Digester 1 volatile solids reduction (\%)}
+    \item{\code{PD1_va_alk_ratio_mgl}}{Digester 1 volatile acid to alkalinity ratio (mg/l)}
+    \item{\code{PD1_methane_pct}}{Digester 1 methane (\%)}
+    \item{\code{PD1_co2_pct}}{Digester 1 carbon dioxide (\%)}
+    \item{\code{PD2_volatile_solids_reduction_pct}}{Digester 2 volatile solids reduction (\%)}
+    \item{\code{PD2_va_alk_ratio_mgl}}{Digester 2 volatile acids to alkalinity ration (mg/l)}
+    \item{\code{PD2_methane_pct}}{Digester 2 methane (\%)}
+    \item{\code{PD2_co2_pct}}{Digester 2 carbon dioxide (\%)}
+    \item{\code{daily_ccr_AD2_Influent}}{Daily averaged carbon consumption rate (CCR) in the influent line to Digester 2}
+    \item{\code{daily_ccr_AD2}}{Daily averaged CCR in the recirculation Digester 2 line}
+    \item{\code{daily_ccr_AD1}}{Daily averaged CCR in the recirculation Digester 1 line}
+  }
+  
+  \strong{(2)} \code{sensor_ad$full_digester_ccr} is a data frame containing 326 rows and 47 columns of full-scale digester data merged with the CCR sensor data:
+  
+  \describe{
+    \item{\code{datetime}}{The date at which an observation is recorded}
+    \item{\code{primary_VS_loading_pct}}{Volatile solid loading percentage in the primary sludge}
+    \item{\code{primary_VS_loading_7dayavg_pct}}{7-day average of volatile solid loading percentage in the primary sludge}
+    \item{\code{twas_VS_loading_pct}}{TWAS volatile solid loading percentage}
+    \item{\code{twas_VS_loading_7dayavg_pct}}{7-day average of TWAS volatile solid loading percentage}
+    \item{\code{external_organic_loading_pct}}{Percentage of external organics loaded}
+    \item{\code{external_organic_loading_7dayavg_pct}}{7-day average of percentage of external organics loaded pct avg (7 days)}
+    \item{\code{biogas_produced_avg_cfday}}{Average biogas produced (cf/day)}
+    \item{\code{methane_produced_total_cfday}}{Total methane produced (cf/day)}
+    \item{\code{methane_produced_avg_cfmin}}{Average methane produced (cf/min)}
+    \item{\code{volatile_solids_reduction_avg_pct}}{Volatile solids reduction average (\%)}
+    \item{\code{temperature_deg_c}}{Temperature of the digester (ºC)}
+    \item{\code{detention_time_1_dig_in_service_days}}{Detention time dig (service days)}
+    \item{\code{primary_flow_total_mgd}}{Total flow of primary sludge (mg/d)}
+    \item{\code{twas_flow_total_mg}}{Total flow of TWAS (mg)}
+    \item{\code{fog_slurry_flow_total_mg}}{Total FOG slurry flow (mg)}
+    \item{\code{fog_flow_total_gal}}{Total FOG flow (gal)}
+    \item{\code{total_feed_flow_mgd}}{Total feed flow (mgd)}
+    \item{\code{waste_provider_daily_fw_total_1_mgd}}{Amount of waste provider 1 daily food waste total (mg/d)}
+    \item{\code{waste_provider_daily_fw_total_2_mgd}}{Amount of waste provider 2 daily food waste total(mg/d)}
+    \item{\code{waste_provider_load_gal}}{Amount of waste provider load (gal)}
+    \item{\code{primary_flow_pct}}{Primary sludge flow (\%)}
+    \item{\code{twas_flow_pct}}{TWAS flow (\%)}
+    \item{\code{fog_flow_pct}}{FOG flow (\%)}
+    \item{\code{primary_TS_pct}}{Primary sludge total solids (\%)}
+    \item{\code{twas_TS_pct}}{TWAS total solids (\%)}
+    \item{\code{slurry_TS_pct}}{Slurry total solids (\%)}
+    \item{\code{waste_provider_TS_pct}}{Waste provider total solids (\%)}
+    \item{\code{primary_VS_pct}}{Primary volatile solids (\%)}
+    \item{\code{twas_VS_pct}}{TWAS volatile solids (\%)}
+    \item{\code{waste_provider_VS_pct}}{Waste provider volatile solids (\%)}
+    \item{\code{waste_provider_ammonia_wet_weight_mgkg}}{Waste provider wet ammonia weight amount (mg/kg)}
+    \item{\code{waste_provider_cod_wet_weight_mgkg}}{Waste provider COD wet weight (mg/kg)}
+    \item{\code{ph_su}}{Digester pH (su)}
+    \item{\code{alkalinity_mgl}}{Digester alkalinity (mg/l)}
+    \item{\code{volatile_acids_mgl}}{Digester acids (mg/l)}
+    \item{\code{va_alk_ratio}}{Digester volatile acid to alkalinity ratio}
+    \item{\code{total_solids_pct}}{Digester total solids (\%)}
+    \item{\code{volatile_solids_pct}}{Digester volatile solids (\%)}
+    \item{\code{vslr_lbs_vs_cf_digester_volumeday}}{Volatile solids reduction (lbs VS/cf digester vol/day)}
+    \item{\code{vslr_lbs_vs_cf_digester_volumeday_7dayavg}}{volatile solids reduction avg (lbs VS/cf digester vol)}
+    \item{\code{waste_provider_ammonia_dry_weight_mgkg}}{Amount of waste provider ammonia dry weight (mg/kg)}
+    \item{\code{waste_provider_cod_dry_weight_mgkg}}{Waste provider COD dry weight (mg/kg)}
+    \item{\code{waste_provider_ammonia_dry_weight_mgkg}}{Amount of waste provider ammonia dry weight (mg/kg)}
+    \item{\code{daily_ccr_digester}}{Daily CCR from the sensor in the recirculation digester line}
+    \item{\code{daily_ccr_slurry}}{Daily CCR from the sensor in the FOG line}
+  }
+  
+  \strong{(3)} \code{sensor_ad$full_scale_wwc_ccr} is a data frame containing 319 rows and 33 columns of full-scale wastewater composition data merged with the CCR sensor data:
+  
+  \describe{
+    \item{\code{datetime}}{The date at which the measurement is recorded}
+    \item{\code{PS_primary_flow_total_mgd}}{Primary sludge flow total (mg/d)}
+    \item{\code{AD_primary_sludge_TS_pct}}{Digester primary sludge total solids (\%)}
+    \item{\code{AD_primary_sludge_VS_pct}}{Digester primary sludge volatile solids (\%)}
+    \item{\code{PS_primary_sludge_TS_load_lbs}}{Primary sludge total solids load (lbs)}
+    \item{\code{PS_primary_sludge_VS_load_lbs}}{Primary sludge volatile solids load (lbs)}
+    \item{\code{AD_feed_primary_sludge_TS_total_weekly_load_lbs}}{Primary sludge total solids weekly load (lbs)}
+    \item{\code{AD_feed_primary_sludge_VS_total_weekly_load_lbs}}{Primary sludge volatile solids weekly load (lbs)}
+    \item{\code{PS_primary_sludge_weekly_TS_load_lbs}}{Primary sludge weekly total solids load (lbs)}
+    \item{\code{PS_primary_sludge_weekly_VS_load_lbs}}{Primary sludge weekly volatile solids load (lbs)}
+    \item{\code{PS_primary_sludge_monthly_TS_load_lbs}}{Primary sludge monthly total solids load (lbs)}
+    \item{\code{AD_twas_flow_total_mgd}}{Digester TWAS flow total (mg/d)}
+    \item{\code{AD_twas_TS_pct}}{Digester TWAS total solids (\%)}
+    \item{\code{AD_twas_VS_pct}}{Digester TWAS volatile solids (\%)}
+    \item{\code{AD_twas_TS_load_lbs}}{Digester TWAS total solids load (lbs)}
+    \item{\code{AD_twas_VS_load_lbs}}{Digester TWAS volatile solids load (lbs)}
+    \item{\code{thickening_twas_sludge_weekly_TS_load_lbs}}{TWAS sludge weekly total solids load}
+    \item{\code{thickening_twas_sludge_weekly_VS_load_lbs}}{TWAS sludge weekly volatile solids load}
+    \item{\code{AD_waste_provider_TS_pct}}{Digester waste provider total solids percentage}
+    \item{\code{AD_waste_provider_VS_pct}}{Digester waste provider volatile solids percentage}
+    \item{\code{AD_FOG_total_MG}}{Digester FOG total (mg)}
+    \item{\code{AD_slurry_TS_pct}}{Digester slurry total solids percentage}
+    \item{\code{AD_slurry_VS_pct}}{Digester slurry volatile solids percentage}
+    \item{\code{AD_FOG_VS_load_lbs}}{Digester FOG volatile solids load (lbs)}
+    \item{\code{AD_FOG_TS_load_lbs}}{Digester FOG total solids load (lbs)}
+    \item{\code{AD_FOG_weekly_TS_load_lbs}}{Digester FOG weekly total solids load (lbs)}
+    \item{\code{AD_FOG_weekly_VS_load_lbs}}{Digester FOG weekly volatile solids load (lbs)}
+    \item{\code{AD_total_feed_flow_mgd}}{Digester total feed flow (mgd)}
+    \item{\code{AD_primary_flow_pct}}{Digester primary flow percentage}
+    \item{\code{AD_twas_flow_pct}}{Digester TWAS percentage}
+    \item{\code{AD_FOG_flow_pct}}{Digester FOG flow percentage}
+    \item{\code{daily_ccr_digester}}{Daily CCR from the sensor in the recirculation digester line}
+    \item{\code{daily_ccr_slurry}}{Daily CCR from the sensor in the FOG line}
+  }
+
+}
+
+\source{
+Provided anonymously by a wastewater treatment facility. 
+
+
+{Pilot Study Process Diagram:}{\cr
+    \if{html}{\figure{pilot_scale_diagram.png}{options: width="100\%"}}
+    \if{latex}{\figure{pilot_scale_diagram.pdf}{options: width=7cm}}
+}
+
+{Full-Scale Process Diagram:}{\cr
+    \if{html}{\figure{full_scale_diagram.png}{options: width="100\%"}}
+    \if{latex}{\figure{full_scale_diagram.pdf}{options: width=7cm}}
+}
+}
+\examples{
+data(sensor_ad)
+
+#- Predictors
+biogas_predictors <- sensor_ad$pilot_merged[c(1, 19, 21, 40, 42, 55, 62)]
+
+#- Plotting biogas over time
+plot(x = biogas_predictors$datetime, y = biogas_predictors$PD1_gas_generation_cfday,
+     xlab = "Time",
+     ylab = "Digester 1 Biogas Generation",
+     main = "Pilot Biogas Over Time")
+
+#- Plotting biogas against volatile solids
+plot(x = biogas_predictors$PD1_VS_pct, y = biogas_predictors$PD1_gas_generation_cfday,
+     xlab = "Volatile Solids",
+     ylab = "Biogas Generation",
+     main = "Pilot Biogas vs Volatile Solids")
+}
+\keyword{datasets}

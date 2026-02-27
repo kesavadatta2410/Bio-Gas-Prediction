@@ -1,0 +1,10 @@
+"total_volatile_solids_raw_pkey","material","trial","total_solids_ppn","volatile_solids_ppn","pH"
+1,"Manure",1,0.199,0.825,NA
+2,"Prairie Grass",1,0.981,0.947,NA
+3,"Manure",2,0.204,0.8317,NA
+4,"Prairie Grass",2,0.981,0.929007,NA
+5,"Manure",3,0.204,0.825,NA
+6,"Manure",4,0.182,0.85,NA
+7,"Sludge",1,0.00175950682734614,0.844702467343976,7.65
+8,"Sludge",2,0.00110947952357637,0.893687707641211,7.5
+9,"Sludge",3,0.00151944894651536,0.724907063197039,7.63

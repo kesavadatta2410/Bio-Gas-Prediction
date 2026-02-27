@@ -1,0 +1,12 @@
+torch>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+scipy>=1.11.0
+tqdm>=4.65.0
+# Optional but recommended
+# shap>=0.44.0         # for SHAP explainability (GradientImportance fallback works without it)
+# onnx>=1.14.0         # for ONNX export
+# onnxruntime>=1.16.0  # for ONNX inference on edge devices

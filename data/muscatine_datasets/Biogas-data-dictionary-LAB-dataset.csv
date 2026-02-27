@@ -1,0 +1,34 @@
+Element or value display name,Description,Unit,Data type,Acceptable values
+Year,Year of data point,Year,float,2020-2023
+Month,Month of data point,Month,float,12-Jan
+Day,Date of data point,Date,float,31-Jan
+V-TWAS_gal,Volume of thickened waste activated sludge added to digesters,Gallons,float,0-10000000
+V-PS_gal,Volume of primary sludge added to digesters,Gallons,float,0-10000000
+V-HSW_gal,Volume of high strength waste activated sludge added to digesters,Gallons,float,0-10000000
+Dig1-T_degF,Temperature of digester 1,Degrees farenheit,float,40-150
+Dig2-T_degF,Temperature of digester 2,Degrees farenheit,float,40-150
+Dig1-pH,pH of digester 1,Standard units,float,0-12
+Dig2-pH,pH of digester 2,Standard units,float,0-12
+FOG_gal,"Volume of fats, oils, and grease received",Gallons,float,0-10000000
+SRT,Solids retention time,Days,float,0-500
+HSW-VS_percent,Volatile solids content of high strength waste,Percent weight by weight,float,0-100
+HSW-COD_mgL,Chemical oxygen demand of high strength waste,Milligrams per liter,float,0-10000000
+Dig1-alk_mgL,"Alkalinity of digester 1, as calcium carbonate",Milligrams per liter,float,0-10000
+Dig2-alk_mgL,"Alkalinity of digester 2, as calcium carbonate",Milligrams per liter,float,0-10000
+Dig1-VFA_mgL,Total volatile fatty acids in digester 1,Milligrams per liter,float,0-10000
+Dig2-VFA_mgL,Total volatile fatty acids in digester 2,Milligrams per liter,float,0-10000
+Dig1-FOS-TAC,Ratio of volatile fatty acids to alkalinity in digester 1,Unitless,float,0-50
+Dig2-FOS-TAC,Ratio of volatile fatty acids to alkalinity in digester 2,Unitless,float,0-50
+Q-influent_MGD,Average flow of influent to plant,Million gallons per day,float,0-50
+BOD-influent_mgL,Biochemical oxygen demand of plant influent,Milligrams per liter,float,0-5000
+TWAS-VS_percent,Volatile solids content of primary sludge,Percent weight by weight,float,0-100
+PS-VS_percent,Volatile solids content of thickened waste activated sludge,Percent weight by weight,float,0-100
+Biogas,Average daily biogas flow ,Cubic feet per minute,float,0-500
+,,,,
+The LABS-raw file has been pre-cleaned using the following steps: ,,,,
+Calculated Biogas flow as total biogas volume in cubic feet  divided by 1440 minutes per day,,,,
+Rows with no Biogas flow information deleted (4/6/21-6/27/21),,,,
+Removed VFA analysis prior to 4/21/20 due to different method,,,,
+"Removed VS and COD data if it matched the previous data point (ex. Fri: 62100, Sat: 62100, Sun: 62100, removed Saturday and Sunday as analyses were only conducted on weekdays) ",,,,
+"Filled in HSW VS and HSW COD as 0 up to 3/16/20, then used the first measurement of VS and COD as the values until the first measurement",,,,
+"Deleted 2 temperatures assumed to be typos (4/4/20, 8/30/22), 1 pH (10/12/20), 1 VFA (8/11/20)",,,,

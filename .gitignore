@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.Python
+pip-log.txt
+
+# Virtual environments
+.venv/
+venv/
+env/
+bio/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Model checkpoints (large binary files)
+models/
+*.pt
+*.pth
+*.pkl
+*.ckpt
+
+# Data (raw CSVs — keep sample data only)
+data/raw/*.csv
+data/interim/
+data/processed/
+
+# Outputs / generated plots
+outputs/
+edaoutput/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets / env
+.env
+*.env
+config_local.py
+
+# Logs
+*.log
+logs/
