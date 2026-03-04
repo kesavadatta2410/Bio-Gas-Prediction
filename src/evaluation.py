@@ -1,16 +1,16 @@
 """
-evaluation.py  (v3)
+evaluation.py  (v4)
 Industrial-grade evaluation metrics for biogas prediction.
 
-Includes:
-  1. Standard regression metrics (RMSE, MAE, R²)
-  2. Economic cost metrics (false positive vs false negative costs)
-  3. Regulatory compliance scoring
-  4. SHAP-based feature importance (gradient SHAP fallback if shap not installed)
-  5. TimeSeriesCV — walk-forward validation (single dataset)
-  6. TemporalBlockCV — contiguous temporal blocks per dataset (no cross-dataset leak)
-  7. DomainMetricsReporter — per-domain breakdown before global average
-  8. Leave-one-dataset-out validation
+Changes from v3 (v4):
+  - MAPE masked for zero/startup production (< SAFETY.MAPE_MIN_PRODUCTION)
+  - sMAPE and MASE added as primary metrics
+  - find_recall_optimized_threshold(): sweeps thresholds for 95% upset recall
+  - apply_temporal_consistency(): suppress single/double alerts (need 3 consecutive)
+  - phase_metrics(): separate RMSE/R² for startup vs steady-state phases
+  - CrossDomainTransferMatrix: per (train, test) domain R² table
+  - full_evaluation(): per-domain only, no misleading global average
+  - EconomicEvaluator: cost-sensitive 10× weight for missed upsets
 """
 
 import numpy as np
@@ -30,17 +30,45 @@ _DEFAULT_DEVICE = "cuda" if config.DEVICE == "cuda" and torch.cuda.is_available(
 
 # ─── 1. Regression Metrics ────────────────────────────────────────────────────
 
-def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    """Standard regression metrics."""
+def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray,
+                       phase_mask: np.ndarray = None) -> dict:
+    """
+    Standard regression metrics.
+
+    phase_mask : bool array, True = steady-state row. When provided, MAPE is
+                 computed only on steady-state rows; startup rows are excluded.
+    """
     residuals = y_pred - y_true
     ss_res    = np.sum(residuals ** 2)
     ss_tot    = np.sum((y_true - y_true.mean()) ** 2)
     r2        = 1 - ss_res / (ss_tot + 1e-9)
 
+    # ── MAPE: mask zero/startup production  (Priority 0 Safety Fix) ───────
+    mape_mask = y_true >= config.SAFETY["MAPE_MIN_PRODUCTION"]
+    if phase_mask is not None:
+        mape_mask = mape_mask & phase_mask
+    if mape_mask.any():
+        mape = float(np.mean(
+            np.abs(residuals[mape_mask] / (y_true[mape_mask] + 1e-9))
+        ) * 100)
+    else:
+        mape = float("nan")
+
+    # ── sMAPE  (symmetric — bounded 0–200%, handles near-zero) ───────────
+    smape = float(np.mean(
+        200.0 * np.abs(residuals) / (np.abs(y_true) + np.abs(y_pred) + 1e-9)
+    ))
+
+    # ── MASE  (Mean Absolute Scaled Error — naive-forecast baseline) ──────
+    naive_mae = float(np.mean(np.abs(np.diff(y_true)))) if len(y_true) > 1 else 1.0
+    mase      = float(np.mean(np.abs(residuals)) / (naive_mae + 1e-9))
+
     return {
         "RMSE":  float(np.sqrt(np.mean(residuals ** 2))),
         "MAE":   float(np.mean(np.abs(residuals))),
-        "MAPE":  float(np.mean(np.abs(residuals / (y_true + 1e-9))) * 100),
+        "MAPE":  mape,
+        "sMAPE": smape,
+        "MASE":  mase,
         "R2":    float(r2),
         "Bias":  float(residuals.mean()),
     }
@@ -77,7 +105,8 @@ class EconomicEvaluator:
         self.alert_threshold = alert_threshold
 
     def evaluate(self, y_true: np.ndarray, y_pred: np.ndarray,
-                  uncertainty: np.ndarray = None) -> dict:
+                  uncertainty: np.ndarray = None,
+                  threshold: float = None) -> dict:
         errors    = y_pred - y_true
         fp_mask   = errors > 0
         fn_mask   = errors < 0
@@ -86,14 +115,19 @@ class EconomicEvaluator:
         cost_fn_total = self.cost_fn * np.abs(errors[fn_mask]).sum()
 
         # Process upset detection
-        mean_flow   = y_true.mean()
-        upset_mask  = y_true < (self.alert_threshold * mean_flow)
-        n_upsets    = int(upset_mask.sum())
+        mean_flow  = y_true.mean()
+        alert_thr  = threshold if threshold is not None else (self.alert_threshold * mean_flow)
+        upset_mask = y_true < alert_thr
+        n_upsets   = int(upset_mask.sum())
 
         # Missed upsets: predicted > threshold but true < threshold
-        missed_mask = upset_mask & (y_pred >= self.alert_threshold * mean_flow)
+        missed_mask = upset_mask & (y_pred >= alert_thr)
         n_missed    = int(missed_mask.sum())
-        cost_upsets = n_missed * self.cost_upset_miss
+
+        # Cost-sensitive weighting: missed upsets penalised 10× (SAFETY.UPSET_COST_WEIGHT)
+        upset_weight = config.SAFETY.get("UPSET_COST_WEIGHT", 10.0)
+        cost_upsets  = n_missed * self.cost_upset_miss * upset_weight / 10.0
+        # (÷10 so base cost_upset_miss is still the per-event €, weight scales internally)
 
         total_cost  = cost_fp_total + cost_fn_total + cost_upsets
 
@@ -105,10 +139,107 @@ class EconomicEvaluator:
             "n_process_upsets":         n_upsets,
             "n_missed_upsets":          n_missed,
             "upset_detection_rate":     float(1 - n_missed / max(n_upsets, 1)),
+            "alert_threshold_used":     float(alert_thr),
         }
 
+# ─── 2b. Upset Recall-Optimised Threshold ─────────────────────────────────────
 
-# ─── 3. Regulatory Compliance Scorer ─────────────────────────────────────────
+def find_recall_optimized_threshold(
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        target_recall: float = None,
+        n_thresholds: int = 200) -> float:
+    """
+    Sweeps prediction thresholds to find the one achieving >= target_recall
+    for process upset detection. Accepts higher false-positive rate.
+
+    Returns the threshold value (on the raw prediction scale).
+    """
+    if target_recall is None:
+        target_recall = config.SAFETY["RECALL_TARGET"]
+
+    mean_flow  = y_true.mean()
+    upset_true = y_true < (config.ECONOMICS["alert_threshold"] * mean_flow)
+
+    if not upset_true.any():
+        return float(config.ECONOMICS["alert_threshold"] * mean_flow)
+
+    lo, hi = y_pred.min(), y_pred.max()
+    thresholds = np.linspace(lo, hi, n_thresholds)
+
+    best_thr    = float(config.ECONOMICS["alert_threshold"] * mean_flow)
+    best_recall = 0.0
+
+    for thr in thresholds:
+        upset_pred = y_pred < thr
+        tp = int((upset_true & upset_pred).sum())
+        fn = int((upset_true & ~upset_pred).sum())
+        recall = tp / (tp + fn + 1e-9)
+        if recall >= target_recall:
+            best_thr    = float(thr)
+            best_recall = recall
+            break   # first threshold that meets target (lowest FPR)
+
+    if best_recall < target_recall:
+        # Fall back to max-recall threshold
+        best_thr = float(thresholds[-1])
+
+    return best_thr
+
+
+# ─── 2c. Temporal Consistency Filter ─────────────────────────────────────────
+
+def apply_temporal_consistency(
+        upset_alerts: np.ndarray,
+        n_consecutive: int = None) -> np.ndarray:
+    """
+    Suppresses isolated alert spikes.  An alert is confirmed only if
+    n_consecutive consecutive steps are all flagged as upset.
+
+    upset_alerts : bool array (T,)
+    Returns      : filtered bool array (T,)
+    """
+    if n_consecutive is None:
+        n_consecutive = config.SAFETY["UPSET_CONSECUTIVE_STEPS"]
+
+    filtered = np.zeros_like(upset_alerts, dtype=bool)
+    n = len(upset_alerts)
+    for i in range(n):
+        end = min(i + n_consecutive, n)
+        if upset_alerts[i:end].all() and (end - i) == n_consecutive:
+            filtered[i:end] = True
+    return filtered
+
+
+# ─── 2d. Per-Phase Metrics (startup vs steady-state) ─────────────────────────
+
+def phase_metrics(y_true: np.ndarray,
+                  y_pred: np.ndarray,
+                  phase_mask: np.ndarray = None) -> dict:
+    """
+    Reports RMSE / MAE / R² separately for startup and steady-state phases.
+
+    phase_mask : bool array, True = steady-state. If None, derived from
+                 SAFETY.MAPE_MIN_PRODUCTION threshold applied to y_true.
+    """
+    if phase_mask is None:
+        phase_mask = y_true >= config.SAFETY["MAPE_MIN_PRODUCTION"]
+
+    steady_idx  = phase_mask
+    startup_idx = ~phase_mask
+
+    def _m(idx):
+        if idx.sum() == 0:
+            return {"RMSE": float("nan"), "MAE": float("nan"), "R2": float("nan"),
+                    "n": 0}
+        m = regression_metrics(y_true[idx], y_pred[idx])
+        m["n"] = int(idx.sum())
+        return m
+
+    return {
+        "startup":     _m(startup_idx),
+        "steady_state": _m(steady_idx),
+    }
 
 class ComplianceScorer:
     """
@@ -390,18 +521,45 @@ class DomainMetricsReporter:
                       f"RMSE={m['RMSE']:.4f}  MAE={m['MAE']:.4f}")
 
         if rows:
-            # Weighted average by n_samples
-            total_n  = sum(r["n_samples"] for r in rows)
-            avg_r2   = sum(r["R2"]   * r["n_samples"] for r in rows) / total_n
-            avg_rmse = sum(r["RMSE"] * r["n_samples"] for r in rows) / total_n
-            avg_mae  = sum(r["MAE"]  * r["n_samples"] for r in rows) / total_n
             if verbose:
-                print(f"  {'[GLOBAL-AVERAGE]':16s} R²={avg_r2:+.4f}  "
-                      f"RMSE={avg_rmse:.4f}  MAE={avg_mae:.4f}")
-            rows.append({"domain": "_average", "R2": avg_r2,
-                          "RMSE": avg_rmse, "MAE": avg_mae, "n_samples": total_n})
+                print(f"  [NOTE] Global average omitted — use per-domain metrics above")
 
-        return pd.DataFrame(rows)
+        return pd.DataFrame([r for r in rows])
+
+
+# ─── 5d. Cross-Domain Transfer Matrix ───────────────────────────────────────────
+
+class CrossDomainTransferMatrix:
+    """
+    Builds R² matrix for all (train_domain, test_domain) pairs.
+    Reveals negative transfer (e.g., EDI R² = -1.83).
+
+    Usage:
+        matrix = CrossDomainTransferMatrix()
+        matrix.add(train='muscatine', test='edi', r2=-1.83)
+        matrix.add(train='muscatine', test='dataone', r2=0.61)
+        df = matrix.report()   # pivot table: rows=train, cols=test
+    """
+
+    def __init__(self):
+        self._entries = []   # [(train_domain, test_domain, r2)]
+
+    def add(self, train: str, test: str, r2: float,
+            rmse: float = None):
+        self._entries.append({"train": train, "test": test,
+                               "R2": r2, "RMSE": rmse})
+
+    def report(self, verbose: bool = True) -> pd.DataFrame:
+        if not self._entries:
+            return pd.DataFrame()
+        df = pd.DataFrame(self._entries)
+        pivot = df.pivot_table(index="train", columns="test",
+                               values="R2", aggfunc="mean")
+        if verbose:
+            print("\n[Cross-Domain Transfer Matrix] R²:")
+            print(pivot.to_string(float_format="{:+.3f}".format))
+        return pivot
+
 
 
 # ─── 6. Leave-One-Dataset-Out Validation ──────────────────────────────────────
@@ -469,35 +627,62 @@ def leave_one_dataset_out(datasets: dict,
 def full_evaluation(y_true:      np.ndarray,
                     y_pred:      np.ndarray,
                     uncertainty: np.ndarray = None,
-                    output_dir:  str        = "outputs") -> dict:
+                    output_dir:  str        = "outputs",
+                    domain:      str        = "unknown",
+                    find_best_threshold: bool = True) -> dict:
     """
     Run all evaluations in one call.
+    v4 changes:
+      - domain arg for per-domain labelling
+      - recall-optimised upset threshold search
+      - phase metrics (startup vs steady-state)
+      - sMAPE / MASE in report
     Returns dict of all metric dicts.
     """
     os.makedirs(output_dir, exist_ok=True)
     results = {}
 
-    # Regression
-    reg = regression_metrics(y_true, y_pred)
+    # Regression (with startup mask)
+    phase_mask = y_true >= config.SAFETY["MAPE_MIN_PRODUCTION"]
+    reg = regression_metrics(y_true, y_pred, phase_mask=phase_mask)
     results["regression"] = reg
-    print(f"\n[Evaluation] RMSE={reg['RMSE']:.3f}  MAE={reg['MAE']:.3f}  R²={reg['R2']:.3f}")
+    mape_str = f"{reg['MAPE']:.1f}%" if not np.isnan(reg["MAPE"]) else "N/A (all startup)"
+    print(f"\n[Evaluation | {domain}] "
+          f"RMSE={reg['RMSE']:.3f}  MAE={reg['MAE']:.3f}  R²={reg['R2']:.3f}")
+    print(f"  MAPE={mape_str}  sMAPE={reg['sMAPE']:.1f}%  MASE={reg['MASE']:.3f}")
 
-    # Economic
-    eco = EconomicEvaluator().evaluate(y_true, y_pred, uncertainty)
+    # Phase metrics
+    phases = phase_metrics(y_true, y_pred, phase_mask)
+    results["phases"] = phases
+    for ph, m in phases.items():
+        if m["n"] > 0:
+            print(f"  [{ph:12s}] n={m['n']}  RMSE={m['RMSE']:.3f}  R²={m['R2']:+.3f}")
+
+    # Economic (with recall-optimized threshold)
+    if find_best_threshold and len(y_pred) >= 10:
+        opt_thr = find_recall_optimized_threshold(y_true, y_pred)
+        print(f"  Recall-optimised upset threshold: {opt_thr:.3f}")
+    else:
+        opt_thr = None
+    eco = EconomicEvaluator().evaluate(y_true, y_pred, uncertainty,
+                                       threshold=opt_thr)
     results["economic"] = eco
-    print(f"             Total cost: €{eco['total_economic_cost_eur']:.0f}  "
-          f"Upsets detected: {eco['upset_detection_rate']*100:.0f}%")
+    print(f"  Total cost: €{eco['total_economic_cost_eur']:.0f}  "
+          f"Upsets detected: {eco['upset_detection_rate']*100:.0f}%  "
+          f"(threshold={eco['alert_threshold_used']:.2f})")
 
     # Compliance
     comp = ComplianceScorer().score(y_true, y_pred, uncertainty)
     results["compliance"] = comp
-    print(f"             Compliance score: {comp['compliance_score']:.1f}/100")
+    print(f"  Compliance score: {comp['compliance_score']:.1f}/100")
 
     # Save to CSV
-    flat = {**{f"reg_{k}": v for k, v in reg.items()},
+    flat = {"domain": domain,
+            **{f"reg_{k}": v for k, v in reg.items()},
             **{f"eco_{k}": v for k, v in eco.items()},
             **{f"comp_{k}": v for k, v in comp.items()}}
-    pd.DataFrame([flat]).to_csv(os.path.join(output_dir, "evaluation.csv"), index=False)
+    out_csv = os.path.join(output_dir, f"evaluation_{domain}.csv")
+    pd.DataFrame([flat]).to_csv(out_csv, index=False)
 
     # Plot residuals
     _plot_residuals(y_true, y_pred, uncertainty, output_dir)

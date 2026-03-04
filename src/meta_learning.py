@@ -123,7 +123,7 @@ class MAMLTrainer:
 
         for _ in range(self.inner_steps):
             inner_optim.zero_grad()
-            gamma, nu, alpha, beta = model_copy.source_forward(sup_X)
+            (gamma, nu, alpha, beta), _ = model_copy.source_forward(sup_X)
             loss = criterion(gamma, sup_y)
             loss.backward()
             inner_optim.step()
@@ -133,7 +133,7 @@ class MAMLTrainer:
     def _task_loss(self, adapted: nn.Module,
                    qry_X: torch.Tensor,
                    qry_y: torch.Tensor) -> torch.Tensor:
-        gamma, nu, alpha, beta = adapted.source_forward(qry_X)
+        (gamma, nu, alpha, beta), _ = adapted.source_forward(qry_X)
         return F.huber_loss(gamma, qry_y, delta=0.5)
 
     def train_epoch(self, n_episodes: int = 50) -> float:
@@ -207,7 +207,7 @@ class MAMLTrainer:
 
         for step in range(n_steps):
             optim.zero_grad()
-            gamma, nu, alpha, beta = adapted.source_forward(sup_X)
+            (gamma, nu, alpha, beta), _ = adapted.source_forward(sup_X)
             loss = criterion(gamma, sup_y)
             loss.backward()
             optim.step()

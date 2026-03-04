@@ -1,29 +1,13 @@
 """
-model.py  (v3 — Domain-Specific Encoders + Latent Biokinetics)
+model.py  (v4 — Domain-Specific Encoders + Latent Biokinetics)
 
-Architecture overview:
-  Three domain-specific encoders:
-    MuscatineEncoder  – CNN → LSTM (for dense, structured SCADA)
-    DataONEEncoder    – GRU with missing-value mask channel
-    EDIEncoder        – Transformer with learned positional encoding
-
-  DomainSimilarityRouter:
-    Routes target batches to the best matching source encoder using
-    cosine similarity between batch embedding and stored domain centroids.
-    Avoids averaging all three encoders which degrades cross-dataset R².
-
-  LatentBiokineticsDecoder:
-    Inserted between encoder and prediction head.
-    Produces (X_hat, S_hat, VFA_hat) — latent biochemical concentrations.
-    Physics constraints attach here (guarantees LSTM gradient flow).
-
-  MahalanobisGate:
-    Fitted on source training embeddings at end of training.
-    At inference, rejects batches with Mahalanobis distance > threshold.
-
-  EvidentialHead:
-    Shared across all domain encoders.
-    Produces (gamma, nu, alpha, beta) for NIG uncertainty.
+Changes from v3 (v4):
+  - ProcessTypeClassifier : auxiliary head (continuous / batch / pilot)
+  - ContinuousDecoder : standard LatentBiokinetics path for continuous domains
+  - BatchDecoder       : takes optional time_since_loading feature — fixes EDI
+  - DomainScaler       : trainable log-affine per domain — fixes 86× scale disparity
+  - BiogasTransferModel.source_forward() routes to correct decoder by domain
+  - freeze_small_domain_encoders() exposes encoder freeze for LODO
 """
 
 import torch
@@ -247,8 +231,9 @@ class DomainSimilarityRouter(nn.Module):
 
     def __init__(self):
         super().__init__()
-        # Centroids set by fit_centroids(); zeros until then
-        self.register_buffer("centroids", torch.zeros(3, 64))
+        # Derive centroid size from config to match encoder output dim exactly
+        _enc_out = config.MODEL["hidden_dims"][0] // 2   # same as enc_out in BiogasTransferModel
+        self.register_buffer("centroids", torch.zeros(3, _enc_out))
         self.register_buffer("centroids_fitted", torch.tensor(False))
 
     def fit_centroids(self, embeddings_dict: dict):
@@ -398,18 +383,86 @@ class MahalanobisGate(nn.Module):
         return dist > self.threshold
 
 
+# ─── Process Type Classifier (v4) ─────────────────────────────────────────────
+
+class ProcessTypeClassifier(nn.Module):
+    """Auxiliary head: 0=continuous, 1=batch, 2=pilot."""
+    def __init__(self, feat_dim: int):
+        super().__init__()
+        n_types = len(config.PROCESS_TYPE)
+        self.net = nn.Sequential(
+            nn.Linear(feat_dim, 32), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(32, n_types),
+        )
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return self.net(feat)
+
+
+# ─── ContinuousDecoder & BatchDecoder (v4) ────────────────────────────────────
+
+class ContinuousDecoder(nn.Module):
+    """Biokinetics decoder for continuous-flow reactors (Muscatine, DataONE)."""
+    def __init__(self, feat_dim: int, hidden: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feat_dim, hidden), nn.SiLU(),
+            nn.LayerNorm(hidden), nn.Linear(hidden, 3),
+        )
+    def forward(self, feat: torch.Tensor, t_loading=None) -> dict:
+        out = F.softplus(self.net(feat))
+        return {"X": out[:, 0:1], "S": out[:, 1:2], "VFA": out[:, 2:3]}
+
+
+class BatchDecoder(nn.Module):
+    """
+    Biokinetics decoder for batch reactors (EDI).
+    Takes time_since_loading to model batch production curve — fixes EDI R²=-1.83.
+    """
+    def __init__(self, feat_dim: int, hidden: int = 64, t_dim: int = 8):
+        super().__init__()
+        self.time_embed = nn.Sequential(nn.Linear(1, t_dim), nn.SiLU())
+        self.net = nn.Sequential(
+            nn.Linear(feat_dim + t_dim, hidden), nn.SiLU(),
+            nn.LayerNorm(hidden), nn.Linear(hidden, 3),
+        )
+    def forward(self, feat: torch.Tensor, t_loading=None) -> dict:
+        if t_loading is None:
+            t_loading = torch.zeros(feat.shape[0], 1, device=feat.device)
+        t_emb = self.time_embed(t_loading)
+        out   = F.softplus(self.net(torch.cat([feat, t_emb], dim=-1)))
+        return {"X": out[:, 0:1], "S": out[:, 1:2], "VFA": out[:, 2:3]}
+
+
+# ─── Domain Scaler (v4 — fixes 86× scale disparity) ──────────────────────────
+
+class DomainScaler(nn.Module):
+    """Trainable log-affine scale per domain. Fixes 86× Muscatine vs DataONE/EDI disparity."""
+    DOMAINS = ["muscatine", "dataone", "edi"]
+    def __init__(self):
+        super().__init__()
+        n = len(self.DOMAINS)
+        self.log_scale = nn.Parameter(torch.zeros(n))
+        self.bias      = nn.Parameter(torch.zeros(n))
+        self._idx = {d: i for i, d in enumerate(self.DOMAINS)}
+    def forward(self, gamma: torch.Tensor, domain: str) -> torch.Tensor:
+        i     = self._idx.get(domain, 0)
+        scale = torch.exp(self.log_scale[i])
+        return scale * gamma + self.bias[i]
+
+
 # ─── Full Transfer Model ───────────────────────────────────────────────────────
 
 class BiogasTransferModel(nn.Module):
     """
-    Enhanced biogas transfer learning model (v3).
+    Enhanced biogas transfer learning model (v4).
 
     Pipeline:
       SensorDropout
       → CrossSensorAttention
       → [MuscatineEncoder | DataONEEncoder | EDIEncoder]
          (selected by DomainSimilarityRouter)
-      → LatentBiokineticsDecoder  (physics gradient path)
+      → ContinuousDecoder | BatchDecoder  (process-type routing, v4)
+      → DomainScaler                      (per-domain affine, v4)
       → EvidentialHead            (prediction + uncertainty)
       → ProcessStateClassifier    (conditional alignment)
       → DomainDiscriminator       (adversarial alignment)
@@ -436,10 +489,17 @@ class BiogasTransferModel(nn.Module):
         # Router
         self.router = DomainSimilarityRouter()
 
-        # Shared decoder + heads
-        self.latent_decoder = LatentBiokineticsDecoder(enc_out)
+        # Decoders: continuous vs batch (v4)
+        self.decoder_continuous = ContinuousDecoder(enc_out)
+        self.decoder_batch      = BatchDecoder(enc_out)
+
+        # Domain scaler to fix 86× scale disparity (v4)
+        self.domain_scaler = DomainScaler()
+
+        # Shared heads
         self.pred_head      = EvidentialHead(enc_out)
-        self.state_clf      = ProcessStateClassifier(enc_out)
+        self.state_clf      = ProcessStateClassifier(enc_out)   # digester state
+        self.process_clf    = ProcessTypeClassifier(enc_out)    # process type (v4)
         self.domain_disc    = DomainDiscriminator(enc_out, alpha=1.0)
         self.maha_gate      = MahalanobisGate(threshold=4.0)
         self.evid_loss      = EvidentialLoss(coeff_reg=1e-2, reject_thresh=2.0)
@@ -505,16 +565,28 @@ class BiogasTransferModel(nn.Module):
 
     def source_forward(self, x: torch.Tensor,
                        domain_id: str = "muscatine",
-                       mask: torch.Tensor = None):
+                       mask: torch.Tensor = None,
+                       t_loading: torch.Tensor = None):
         """
         Returns:
-          (gamma, nu, alpha, beta)  — NIG parameters for evidential loss
-          latent_states             — {'X', 'S', 'VFA'} for physics loss
+          (gamma_scaled, nu, alpha, beta) — NIG parameters (gamma is domain-scaled)
+          latent_states                   — {'X', 'S', 'VFA'} for physics loss
         """
-        feat   = self._encode(x, domain_id, mask)
-        latent = self.latent_decoder(feat)
+        feat = self._encode(x, domain_id, mask)
+
+        # Route to correct decoder based on process type (v4)
+        process_type = config.DOMAIN_PROCESS_MAP.get(domain_id, "continuous")
+        if process_type == "batch":
+            latent = self.decoder_batch(feat, t_loading)
+        else:
+            latent = self.decoder_continuous(feat)
+
         g, nu, alpha, beta = self.pred_head(feat)
-        return (g, nu, alpha, beta), latent
+
+        # Apply trainable domain scaler (v4)
+        g_scaled = self.domain_scaler(g, domain_id)
+
+        return (g_scaled, nu, alpha, beta), latent
 
     def adapt_forward(self, src_x: torch.Tensor, tgt_x: torch.Tensor,
                       src_domain: str = "muscatine",
@@ -525,9 +597,15 @@ class BiogasTransferModel(nn.Module):
         Alignment is conditional: only within the same process-state class.
         Returns: pred_src, dom_src, dom_tgt, f_sa, f_ta, state_src, state_tgt, latent
         """
-        feat_src  = self._encode(src_x, src_domain)
-        feat_tgt  = self._encode(tgt_x, tgt_domain)
-        latent    = self.latent_decoder(feat_src)
+        feat_src = self._encode(src_x, src_domain)
+        feat_tgt = self._encode(tgt_x, tgt_domain)
+
+        # Use correct decoder for source domain
+        proc_src = config.DOMAIN_PROCESS_MAP.get(src_domain, "continuous")
+        latent   = (self.decoder_batch(feat_src)
+                    if proc_src == "batch"
+                    else self.decoder_continuous(feat_src))
+
         pred_src  = self.pred_head(feat_src)
         state_src = self.state_clf(feat_src)
         state_tgt = self.state_clf(feat_tgt)
@@ -544,6 +622,35 @@ class BiogasTransferModel(nn.Module):
         dom_src = self.domain_disc(f_sa)
         dom_tgt = self.domain_disc(f_ta)
         return pred_src, dom_src, dom_tgt, f_sa, f_ta, state_src, state_tgt, latent
+
+    def freeze_small_domain_encoders(
+            self,
+            small_domains: list = None,
+            verbose: bool = True):
+        """
+        Freezes encoders for small domains during LODO / fine-tuning.
+        Prevents catastrophic forgetting when adapting to a new target domain.
+
+        Args:
+          small_domains : list of domain names to freeze, e.g. ['edi','dataone'].
+                          If None, uses config.SMALL_DOMAINS (falls back to edi+dataone).
+        """
+        if small_domains is None:
+            small_domains = getattr(config, "SMALL_DOMAINS",
+                                    ["edi", "dataone"])
+        enc_map = {
+            "muscatine": self.encoder_muscatine,
+            "dataone":   self.encoder_dataone,
+            "edi":       self.encoder_edi,
+        }
+        for domain in small_domains:
+            enc = enc_map.get(domain)
+            if enc is None:
+                continue
+            for p in enc.parameters():
+                p.requires_grad = False
+            if verbose:
+                print(f"  [LODO] Frozen encoder: {domain}")
 
     def set_grl_alpha(self, alpha: float):
         self.domain_disc.grl.alpha = alpha

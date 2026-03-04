@@ -40,7 +40,29 @@ os.makedirs(config.OUTPUT_DIR, exist_ok=True)
 device = torch.device(
     "cuda" if config.DEVICE == "cuda" and torch.cuda.is_available() else "cpu"
 )
-print(f"[train_source v3] Device: {device}")
+print(f"[train_source v4] Device: {device}")
+
+
+# ─── Sequence Length Audit ────────────────────────────────────────────────────
+
+def audit_sequence_lengths(loader, verbose: bool = True) -> dict:
+    """
+    Verifies all domains have sequences meeting the minimum length.
+    Warns loudly if continuous process sequences < config.TRAIN.seq_len_min_continuous.
+    """
+    min_cont = config.TRAIN.get("seq_len_min_continuous", 48)
+    report   = {}
+    for domain, process_type in config.DOMAIN_PROCESS_MAP.items():
+        if process_type in ("continuous", "pilot"):
+            seq_len = config.TRAIN.get("seq_len", 48)
+            ok      = seq_len >= min_cont
+            report[domain] = {"ok": ok, "seq_len": seq_len, "min": min_cont}
+            if not ok and verbose:
+                print(f"  [SEQ WARN] {domain}: seq_len={seq_len} < min={min_cont} "
+                      f"(need 2× HRT for continuous processes)")
+    if verbose and all(r["ok"] for r in report.values()):
+        print(f"  [SEQ OK] All continuous domains: seq_len={config.TRAIN['seq_len']} ≥ {min_cont}")
+    return report
 
 
 # ─── Schedulers ───────────────────────────────────────────────────────────────
@@ -52,13 +74,49 @@ def grl_alpha_schedule(epoch: int, total_epochs: int) -> float:
 
 def physics_weight_schedule(epoch: int, total_epochs: int) -> float:
     """
-    Residual weight scheduler: starts at 0, reaches 1.0 linearly
-    over the first 50% of training.  Stays at 1.0 thereafter.
-    This prevents physics loss from overpowering data loss early on
-    when latent states are still randomly initialised.
+    Residual weight scheduler: starts at 0, reaches MAX linearly
+    over the first 50% of training.
+
+    MAX is capped at 0.01 (not 1.0) because raw ODE residuals are in
+    physical units (m³/day) and are 6-9 orders of magnitude larger than
+    the normalised evidential task loss. Allowing weight > 0.01 causes
+    the physics loss to completely dominate, explode gradients, and
+    corrupt val loss so checkpoints are never saved.
     """
+    max_weight    = 0.01
     warmup_epochs = max(1, total_epochs // 2)
-    return min(1.0, epoch / warmup_epochs)
+    return min(max_weight, max_weight * epoch / warmup_epochs)
+
+
+def teacher_forcing_schedule(epoch: int, total_epochs: int) -> float:
+    """
+    Teacher forcing probability: starts at TRAIN.teacher_forcing_init (1.0)
+    and decays linearly to TRAIN.teacher_forcing_final (0.0) over training.
+    Use ground-truth token with probability p; model's prior output with 1-p.
+    """
+    tf_init  = config.TRAIN.get("teacher_forcing_init",  1.0)
+    tf_final = config.TRAIN.get("teacher_forcing_final", 0.0)
+    return tf_init - (tf_init - tf_final) * (epoch / max(1, total_epochs))
+# ─── Cost-Sensitive Upset Loss ────────────────────────────────────────────────
+
+def upset_cost_loss(y_true: torch.Tensor,
+                    y_pred: torch.Tensor,
+                    weight: float = None) -> torch.Tensor:
+    """
+    Cost-sensitive auxiliary loss that penalizes missed upsets 10× more
+    than missed non-upsets.
+
+    upset_mask = rows where y_true < 0.5 * mean(y_true)
+    Applies SAFETY.UPSET_COST_WEIGHT to those residuals.
+    """
+    if weight is None:
+        weight = config.SAFETY.get("UPSET_COST_WEIGHT", 10.0)
+    mean_flow  = y_true.mean().detach()
+    upset_mask = (y_true < 0.5 * mean_flow).float()
+    # Weighted MSE: upset rows penalised more
+    sq_err     = (y_pred - y_true) ** 2
+    weighted   = sq_err * (1.0 + (weight - 1.0) * upset_mask)
+    return weighted.mean()
 
 
 # ─── Gradient Diagnostic ──────────────────────────────────────────────────────
@@ -123,11 +181,38 @@ def train_source():
     evid_loss = EvidentialLoss(coeff_reg=1e-2)
     pinn_loss = PhysicsInformedLoss(w_ode=0.20, w_vfa=0.10, w_thermo=0.05)
 
-    optim = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.TRAIN["lr"],
-        weight_decay=config.TRAIN["weight_decay"],
-    )
+    # Per-domain learning rates (v4): smaller domains get higher LR
+    lr_per_domain = config.TRAIN.get("lr_per_domain", {})
+    # Build param groups: domain-specific encoder params get domain LR;
+    # all others use global "lr"
+    param_groups = []
+    domain_lr_map = {}  # param_name_prefix -> lr
+    for domain, lr_d in lr_per_domain.items():
+        domain_lr_map[f"encoders.{domain}"] = lr_d
+
+    grouped_params = set()
+    for prefix, lr_val in domain_lr_map.items():
+        group_params = [(n, p) for n, p in model.named_parameters()
+                        if n.startswith(prefix)]
+        if group_params:
+            param_groups.append({
+                "params":       [p for _, p in group_params],
+                "lr":           lr_val,
+                "weight_decay": config.TRAIN["weight_decay"],
+            })
+            grouped_params.update(n for n, _ in group_params)
+
+    # Remaining params at global LR
+    remaining = [p for n, p in model.named_parameters()
+                 if n not in grouped_params]
+    param_groups.append({
+        "params":       remaining,
+        "lr":           config.TRAIN["lr"],
+        "weight_decay": config.TRAIN["weight_decay"],
+    })
+    print(f"  [Optim] {len(param_groups)-1} domain-specific LR groups + 1 global")
+
+    optim = torch.optim.AdamW(param_groups)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optim, T_0=20, T_mult=2
     )
@@ -140,8 +225,12 @@ def train_source():
     epochs     = config.TRAIN["source_epochs"]
     history    = {
         "train_task": [], "train_phys": [], "train_phys_weight": [],
-        "val": [], "pred_var": [], "grad_lstm": []
+        "val": [], "pred_var": [], "grad_lstm": [],
+        "phys_compliance": [], "mean_dX_residual": []
     }
+
+    # Sequence length audit (v4)
+    audit_sequence_lengths(loader)
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -149,6 +238,8 @@ def train_source():
         model.set_grl_alpha(grl_alpha_schedule(epoch, epochs))
 
         tr_task, tr_phys = [], []
+        phys_diag_batch  = []
+        teacher_p        = teacher_forcing_schedule(epoch, epochs)
 
         for X_batch, y_batch in tr_dl:
             X_batch = X_batch.to(device)
@@ -159,12 +250,11 @@ def train_source():
             (gamma, nu, alpha, beta), latent_t1 = model.source_forward(
                 X_batch, domain_id="muscatine"
             )
-            task_l = evid_loss(y_batch, gamma, nu, alpha, beta)
+            task_l  = evid_loss(y_batch, gamma, nu, alpha, beta)
+            upset_l = upset_cost_loss(y_batch.squeeze(-1), gamma.squeeze(-1))
 
             # ── Physics loss on LATENT states (not raw biogas) ─────────────
-            # Use last-step latent as t1; shift input by 1 for t0 approximation
             with torch.no_grad():
-                # t0: same batch slightly shifted (use zero-grad proxy)
                 X_shift = torch.roll(X_batch, shifts=1, dims=1)
                 X_shift[:, 0, :] = X_batch[:, 0, :]  # wrap-around fix
             (_, _, _, _), latent_t0 = model.source_forward(
@@ -176,13 +266,21 @@ def train_source():
                 "t1": latent_t1,
             }
 
-            # Optional sensor dict for thermodynamic loss
             sensor_batch = build_si_batch(X_batch, loader.feature_cols)
 
-            phys_l = pinn_loss(latent_states, sensor_batch,
-                               dt=1.0, weight=physics_w)
+            # weight=1.0: get the raw residual first, then clamp, then scale.
+            # This prevents the clamp from always saturating at max before
+            # physics_w is applied (which made Phys always = 100 regardless of training).
+            phys_raw, phys_diag = pinn_loss(latent_states, sensor_batch,
+                                             dt=1.0, weight=1.0,
+                                             return_diagnostics=True)
+            phys_diag_batch.append(phys_diag)
 
-            loss = task_l + phys_l
+            # Clamp raw residual (physical units), then apply schedule weight.
+            # Final physics contribution is at most physics_w * 10.0 ≤ 0.01 * 10 = 0.1
+            phys_l = physics_w * torch.clamp(phys_raw, max=10.0)
+
+            loss = task_l + 0.1 * upset_l + phys_l
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optim.step()
@@ -210,10 +308,16 @@ def train_source():
         tr_p = np.mean(tr_phys)
         vl   = np.mean(val_losses)
 
+        # Aggregate physics diagnostics
+        mean_compliance  = np.mean([d["compliance_pct"]   for d in phys_diag_batch])
+        mean_dX_residual = np.mean([d["mean_dX_residual"] for d in phys_diag_batch])
+
         history["train_task"].append(tr_t)
         history["train_phys"].append(tr_p)
         history["train_phys_weight"].append(physics_w)
         history["val"].append(vl)
+        history["phys_compliance"].append(mean_compliance)
+        history["mean_dX_residual"].append(mean_dX_residual)
 
         # ── Diagnostics (every 10 epochs) ────────────────────────────────
         if epoch % 10 == 0 or epoch == 1:
@@ -229,7 +333,9 @@ def train_source():
             print(f"  Epoch {epoch:3d}/{epochs} | "
                   f"Task={tr_t:.4f} | Phys={tr_p:.4f} (w={physics_w:.2f}) | "
                   f"Val={vl:.4f} | LR={scheduler.get_last_lr()[0]:.2e} | "
-                  f"LSTM|grad|={mean_lstm_g:.2e} | PredVar={pred_var:.4f}")
+                  f"LSTM|grad|={mean_lstm_g:.2e} | PredVar={pred_var:.4f} | "
+                  f"Compliance={mean_compliance:.2%} | dX_res={mean_dX_residual:.4f} | "
+                  f"TF={teacher_p:.2f}")
         else:
             print(f"  Epoch {epoch:3d}/{epochs} | "
                   f"Task={tr_t:.4f} | Phys={tr_p:.4f} (w={physics_w:.2f}) | "
@@ -266,7 +372,22 @@ def train_source():
         os.path.join(config.MODEL_DIR, "source_best.pt"),
         map_location=device, weights_only=False
     )
-    model.load_state_dict(ckpt["model_state"])
+    # Filter out post-training fitted buffers before loading —
+    # strict=False alone doesn't bypass shape mismatches in PyTorch.
+    # These buffers are already correctly fitted in memory from the
+    # fit_domain_router / fit_maha_gate calls above.
+    _SKIP_BUFFERS = {
+        "router.centroids",
+        "router.centroids_fitted",
+        "maha_gate.mean_",
+        "maha_gate.inv_cov_",
+        "maha_gate.fitted_",
+    }
+    filtered_state = {k: v for k, v in ckpt["model_state"].items()
+                      if k not in _SKIP_BUFFERS}
+    missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+    if unexpected:
+        print(f"  [EWC] Unexpected keys (ignored): {unexpected[:3]}")
     ewc = EWC(model, tr_dl, device=str(device), n_batches=30)
     ewc.compute_fisher()
     ckpt["ewc_fisher"]     = ewc.fisher_
@@ -284,6 +405,7 @@ def train_source():
 
 
 def _save_checkpoint(model, loader, replay_buf, epoch):
+    os.makedirs(config.MODEL_DIR, exist_ok=True)   # guarantee dir exists
     torch.save({
         "epoch":          epoch,
         "model_state":    model.state_dict(),
@@ -295,6 +417,7 @@ def _save_checkpoint(model, loader, replay_buf, epoch):
         "replay_buffer_X": replay_buf.buffer_X[:500],
         "replay_buffer_y": replay_buf.buffer_y[:500],
     }, os.path.join(config.MODEL_DIR, "source_best.pt"))
+    print(f"    [CKPT] Saved epoch {epoch} → {config.MODEL_DIR}/source_best.pt")
 
 
 def _evaluate_test(model, te_dl, loader, evid_loss, history):

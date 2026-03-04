@@ -1,15 +1,13 @@
 """
-dataset.py  (v3 — Per-Dataset Scalers + Temporal Splits + Masking)
+dataset.py  (v4 — Per-Dataset Scalers + Temporal Splits + Masking)
 
-Changes from v2:
-  - Per-dataset StandardScaler (separate for Muscatine / DataONE / EDI)
-    instead of one global scaler that distorted cross-domain distributions.
-  - MaskedSequenceDataset: carries (X, mask, y) for DataONE sparse handling.
-  - Temporal-block train/val/test split (no random shuffle — preserves
-    time structure and prevents data leakage between contiguous blocks).
-  - SourceDataLoader.load() returns scalers dict + feature_col dict per domain.
-  - TargetDataLoader.load(target_type) does asymmetric source selection:
-    uses the closest domain's scaler rather than the global one.
+Changes from v3 (v4):
+  - DomainWeightedSampler : inverse-frequency oversampling to fix 750:1 imbalance
+  - time_since_loading()  : derives batch-loading events from zero-production
+    windows (no extra CSV column required) and builds t_loading feature
+  - make_sequences_with_phase_mask(): emits per-step steady-state bool mask
+  - SourceDataLoader gains domain label and phase mask outputs
+  - make_sequences() now optionally appends time_since_loading as final feature
 """
 
 import os
@@ -17,7 +15,7 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import config
 
 
@@ -68,6 +66,108 @@ def make_sequences_with_mask(X: np.ndarray, mask: np.ndarray,
     return (np.array(xs, dtype=np.float32),
             np.array(ms, dtype=np.float32),
             np.array(ys, dtype=np.float32))
+
+
+def make_sequences_with_phase_mask(X: np.ndarray, y: np.ndarray,
+                                    seq_len: int,
+                                    min_production: float = None):
+    """
+    Sliding-window sequences that also produce a per-sequence steady-state flag.
+
+    phase_mask[i] = True if the TARGET at position i+seq_len is in
+    steady-state (y >= SAFETY.MAPE_MIN_PRODUCTION).
+
+    Returns: (X_seq, y_seq, phase_mask_seq)
+      phase_mask_seq : bool (N,) — True = steady-state
+    """
+    if min_production is None:
+        min_production = config.SAFETY.get("MAPE_MIN_PRODUCTION", 0.1)
+    xs, ys, pms = [], [], []
+    for i in range(len(X) - seq_len):
+        xs.append(X[i:i + seq_len])
+        ys.append(y[i + seq_len])
+        pms.append(y[i + seq_len] >= min_production)
+    return (np.array(xs,  dtype=np.float32),
+            np.array(ys,  dtype=np.float32),
+            np.array(pms, dtype=bool))
+
+
+# ─── Time-Since-Loading Feature (EDI Batch Reactors) ──────────────────────────
+
+def time_since_loading(y: np.ndarray,
+                       startup_threshold: float = None,
+                       startup_window: int = 3) -> np.ndarray:
+    """
+    Derives time-since-loading (days) from a biogas flow timeseries.
+
+    Algorithm:
+      A new batch LOADING EVENT is detected when y drops below
+      startup_threshold for at least startup_window consecutive steps
+      (indicates emptying + refilling).
+      Then t_since_loading is reset to 0 at that event and counts up.
+
+    No extra CSV column required — fully derived from y.
+
+    Args:
+      y                : 1-D array, raw biogas flow (unnormalised)
+      startup_threshold: y < thr => startup. Default = 10% of max(y)
+      startup_window   : min consecutive low steps to trigger loading event
+
+    Returns: 1-D float array, same length as y, values in [0, len(y)]
+    """
+    if startup_threshold is None:
+        startup_threshold = max(y) * 0.10  # 10% of peak = startup
+
+    n = len(y)
+    t_since = np.zeros(n, dtype=np.float32)
+    days_since = 0
+    low_streak = 0
+
+    for i in range(n):
+        if y[i] < startup_threshold:
+            low_streak += 1
+        else:
+            low_streak = 0
+
+        if low_streak >= startup_window:
+            days_since = 0  # loading event detected
+            low_streak = 0
+        else:
+            days_since += 1
+
+        t_since[i] = float(days_since)
+
+    # Normalise to [0, 1] over the full series length
+    max_t = max(t_since.max(), 1.0)
+    return t_since / max_t
+
+
+# ─── Domain Weighted Sampler (fixes 750:1 imbalance) ─────────────────────────
+
+def make_domain_weighted_sampler(domain_labels: np.ndarray) -> WeightedRandomSampler:
+    """
+    Inverse-frequency weighting so every domain gets equal expected samples
+    per batch, regardless of dataset size.
+
+    Args:
+      domain_labels : int array (N,), one label per sequence
+
+    Returns: WeightedRandomSampler for use in DataLoader(sampler=...)
+    """
+    labels   = np.asarray(domain_labels)
+    classes  = np.unique(labels)
+    n_total  = len(labels)
+    weights  = np.zeros(n_total, dtype=np.float64)
+    for cls in classes:
+        mask = labels == cls
+        freq = mask.sum() / n_total
+        weights[mask] = 1.0 / (freq + 1e-9)
+    weights = weights / weights.sum() * n_total   # normalise to sum=N
+    return WeightedRandomSampler(
+        weights=torch.DoubleTensor(weights),
+        num_samples=n_total,
+        replacement=True
+    )
 
 
 def temporal_block_split(n: int, val_frac: float = 0.15,

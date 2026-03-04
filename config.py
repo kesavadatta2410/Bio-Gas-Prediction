@@ -1,5 +1,5 @@
 """
-config.py  (v2)
+config.py  (v4)
 Central configuration for Biogas Transfer Learning System.
 Edit this file before running any scripts.
 """
@@ -46,6 +46,27 @@ MODEL = {
     "num_mc_samples": 30,
 }
 
+# ─── Process Types ────────────────────────────────────────────────────────────
+PROCESS_TYPE = {"continuous": 0, "batch": 1, "pilot": 2}
+DOMAIN_PROCESS_MAP = {"muscatine": "continuous", "dataone": "pilot", "edi": "batch"}
+
+# ─── Safety & Recall ──────────────────────────────────────────────────────────
+SAFETY = {
+    "RECALL_TARGET":           0.95,   # target upset-detection recall
+    "UPSET_CONSECUTIVE_STEPS": 3,      # require N consecutive steps before alerting
+    "MAPE_MIN_PRODUCTION":     0.1,    # mask MAPE when y_true < this (startup phase)
+    "UPSET_COST_WEIGHT":       10.0,   # loss weighting for missed upsets vs false alarms
+}
+
+# ─── Unit Conversion ──────────────────────────────────────────────────────────
+# Target: Nm³ CH₄ / kg VS·added / day  (specific methane yield)
+UNIT_CONVERSION = {
+    "muscatine_divide_by_cod":  True,   # Muscatine: divide by influent COD load
+    "dataone_normalize_volume": True,   # DataONE:   normalise by reactor working volume
+    "edi_batch_to_daily":       True,   # EDI:       convert cumulative batch → daily rate
+    "ch4_fraction":             0.60,   # typical biogas CH₄ fraction (60%)
+}
+
 # ─── Training ─────────────────────────────────────────────────────────────────
 TRAIN = {
     "source_epochs":  20,
@@ -58,7 +79,20 @@ TRAIN = {
     "patience":       15,
     "val_split":      0.15,
     "test_split":     0.15,
-    "seq_len":        24,     # hours of history per sequence
+    "seq_len":        48,      # ≥48 h for continuous (2× HRT); full batch for EDI
+    # Per-domain learning rates (small domains need higher LR to learn from few samples)
+    "lr_per_domain": {
+        "muscatine": 1e-4,
+        "dataone":   1e-3,
+        "edi":       1e-3,
+    },
+    # Teacher forcing: 1.0 = always use ground truth; decays to 0.0 (autoregressive)
+    "teacher_forcing_init":  1.0,
+    "teacher_forcing_final": 0.0,
+    # Delta prediction: train on y(t)-y(t-1) instead of absolute y(t)
+    "predict_delta":         False,   # set True to enable stationary targets
+    # Sequence length minimums
+    "seq_len_min_continuous": 48,    # 2 × typical HRT (hours)
 }
 
 # ─── Physics Constraints ──────────────────────────────────────────────────────

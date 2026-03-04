@@ -24,7 +24,7 @@ import config
 from src.dataset          import SourceDataLoader, TargetDataLoader
 from src.model            import BiogasTransferModel, mmd_loss
 from src.evidential_loss  import EvidentialLoss
-from src.physics_loss     import PhysicsInformedLoss, build_physics_dict
+from src.physics_loss     import PhysicsInformedLoss, build_si_batch
 from src.active_learning  import ActiveLearningManager
 from src.continual_learning import ReplayBuffer, EWC, OnlineAdapter
 from src.data_quality     import assign_sensor_groups
@@ -97,7 +97,10 @@ def adapt_target():
         print(f"[Replay] Loaded {len(replay_buf)} source samples.")
 
     # 4. Load target data
-    tgt_loader = TargetDataLoader(scaler_X, scaler_y, feature_cols)
+    tgt_loader = TargetDataLoader(
+        scalers={"muscatine": (scaler_X, scaler_y)},
+        feature_cols=feature_cols,
+    )
     tgt_adapt_dl, tgt_fs_dl = tgt_loader.load(few_shot_fraction=0.1)
 
     # 5. Active learning: select most informative samples from target pool
@@ -192,12 +195,12 @@ def _run_alignment(model, src_dl, tgt_dl, scaler_y, ewc):
 
             optim.zero_grad()
             (gamma, nu, alpha_p, beta), dom_src, dom_tgt, f_src, f_tgt, \
-                state_src, state_tgt = model.adapt_forward(src_X, tgt_X, conditioning=True)
+                state_src, state_tgt, _latent = model.adapt_forward(src_X, tgt_X, conditioning=True)
 
             # Task + physics
-            task_l = evid_loss(src_y, gamma, nu, alpha_p, beta)
-            phys_d = build_physics_dict(src_X, [])
-            phys_l = pinn_loss(phys_d, gamma)
+            task_l   = evid_loss(src_y, gamma, nu, alpha_p, beta)
+            sensor_b = build_si_batch(src_X, [])
+            phys_l   = pinn_loss({"t0": {}, "t1": {}}, sensor_b, dt=1.0, weight=0.01)
 
             # Adversarial
             adv_l = (bce(dom_src, torch.ones_like(dom_src))
@@ -238,9 +241,11 @@ def _run_alignment(model, src_dl, tgt_dl, scaler_y, ewc):
 # ─── Few-shot step ────────────────────────────────────────────────────────────
 
 def _run_fewshot(model, fs_dl, scaler_y, ewc):
-    # Freeze backbone
-    for p in model.encoder.parameters():
-        p.requires_grad = False
+    # Freeze all three domain encoders (backbone) — only decoder + head train
+    _encoders = [model.encoder_muscatine, model.encoder_dataone, model.encoder_edi]
+    for enc in _encoders:
+        for p in enc.parameters():
+            p.requires_grad = False
 
     optim     = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4
@@ -253,8 +258,13 @@ def _run_fewshot(model, fs_dl, scaler_y, ewc):
         losses = []
         for batch in fs_dl:
             X_b, y_b = batch[0].to(device), batch[1].to(device)
+            # y_b may be (B, T) from sequence loader — take last step → (B, 1)
+            if y_b.dim() > 1 and y_b.shape[1] > 1:
+                y_b = y_b[:, -1:]
+            elif y_b.dim() == 1:
+                y_b = y_b.unsqueeze(-1)
             optim.zero_grad()
-            gamma, nu, alpha_p, beta = model.source_forward(X_b)
+            (gamma, nu, alpha_p, beta), _ = model.source_forward(X_b)
             loss = evid_loss(y_b, gamma, nu, alpha_p, beta)
             if ewc:
                 loss = loss + ewc.penalty(model, lambda_ewc=0.2)
@@ -265,7 +275,7 @@ def _run_fewshot(model, fs_dl, scaler_y, ewc):
         if epoch % 10 == 0 or epoch == 1:
             print(f"  Fine-tune {epoch:3d}/{epochs}  Loss={np.mean(losses):.4f}")
 
-    # Unfreeze
+    # Unfreeze all
     for p in model.parameters():
         p.requires_grad = True
 

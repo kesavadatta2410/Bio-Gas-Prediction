@@ -97,7 +97,7 @@ def export_onnx(model: nn.Module,
                 super().__init__()
                 self.m = m
             def forward(self, x):
-                gamma, _, _, _ = self.m.source_forward(x)
+                (gamma, _, _, _), _ = self.m.source_forward(x)
                 return gamma
 
         wrapper = ExportWrapper(model)

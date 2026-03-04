@@ -105,7 +105,7 @@ class GradientSampler:
             x = X_pool[i:i+1].to(self.device)
             self.model.zero_grad()
 
-            gamma, nu, alpha, beta = self.model.source_forward(x)
+            (gamma, nu, alpha, beta), _ = self.model.source_forward(x)
             # Use the mean prediction as a proxy loss
             loss = gamma.abs().mean()
             loss.backward()

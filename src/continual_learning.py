@@ -124,7 +124,7 @@ class EWC:
             y_batch = y_batch.to(self.device)
 
             self.model.zero_grad()
-            gamma, nu, alpha, beta = self.model.source_forward(X_batch)
+            (gamma, nu, alpha, beta), _ = self.model.source_forward(X_batch)
             loss = criterion(gamma, y_batch)
             loss.backward()
 
@@ -229,13 +229,13 @@ class OnlineAdapter:
         # Generate pseudo-labels if none provided
         if y_new is None:
             with torch.no_grad():
-                gamma, _, _, _ = self.model.source_forward(X_t)
+                (gamma, _, _, _), _ = self.model.source_forward(X_t)
             y_t = gamma.detach()
         else:
             y_t = torch.tensor(y_new, dtype=torch.float32).unsqueeze(-1).to(self.device)
 
         # Forward on new batch
-        gamma, nu, alpha, beta = self.model.source_forward(X_t)
+        (gamma, nu, alpha, beta), _ = self.model.source_forward(X_t)
         loss_new = self.criterion(gamma, y_t)
 
         # Replay: mix in source samples
@@ -245,7 +245,7 @@ class OnlineAdapter:
             X_rep, y_rep = self.buffer.sample(n_replay)
             X_rep_t = torch.tensor(X_rep, dtype=torch.float32).to(self.device)
             y_rep_t = torch.tensor(y_rep, dtype=torch.float32).unsqueeze(-1).to(self.device)
-            gamma_r, *_ = self.model.source_forward(X_rep_t)
+            (gamma_r, *_), _ = self.model.source_forward(X_rep_t)
             loss_rep    = self.criterion(gamma_r, y_rep_t)
             total_loss  = total_loss + loss_rep
 

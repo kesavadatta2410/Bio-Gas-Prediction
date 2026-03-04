@@ -1,15 +1,12 @@
 """
-physics_loss.py  (v3 — Latent State Physics)
+physics_loss.py  (v4 — Latent State Physics)
 Physics-Informed Neural Network (PINN) loss module.
 
-Key changes from v2:
-  - PhysicsNormLayer : converts raw sensor units → SI before residuals
-  - LatentODEResiduals: Monod/mass balance on LATENT biokinetic states
-    (X_hat, S_hat, VFA_hat) decoded from LSTM hidden state, not on
-    raw biogas flow (which had no gradient path to LSTM weights)
-  - PhysicsInformedLoss.forward() now accepts `latent_states` dict and
-    a scalar `weight` for the residual weight schedule (0 → 1)
-  - build_physics_dict replaced by build_si_batch (unit-safe extraction)
+Changes from v3 (v4):
+  - Softplus replaces ReLU on X/S latent constraints (smooth, non-zero gradient)
+  - compute_compliance(): fraction of batch violating mass balance > 5%
+  - log_residuals(): returns mean |dX/dt_obs - dX/dt_pred| for training diagnostics
+  - PhysicsInformedLoss.forward() gains return_diagnostics flag
 """
 
 import torch
@@ -110,10 +107,11 @@ class LatentODEResiduals(nn.Module):
         if "X" not in latent_t0 or "S" not in latent_t0:
             return torch.tensor(0.0, requires_grad=False)
 
-        X0 = F.relu(latent_t0["X"])
-        S0 = F.relu(latent_t0["S"])
-        X1 = F.relu(latent_t1["X"])
-        S1 = F.relu(latent_t1["S"])
+        # Softplus instead of ReLU — smooth gradient, strictly positive (v4 fix)
+        X0 = F.softplus(latent_t0["X"])
+        S0 = F.softplus(latent_t0["S"])
+        X1 = F.softplus(latent_t1["X"])
+        S1 = F.softplus(latent_t1["S"])
         I0 = latent_t0.get("I", None)
 
         mu = _monod_rate(S0, I0)
@@ -131,6 +129,51 @@ class LatentODEResiduals(nn.Module):
 
         return res_X + res_S
 
+# ─── 3b. Physics Compliance Metrics (v4) ────────────────────────────────────
+
+@torch.no_grad()
+def compute_compliance(latent_t0: dict, latent_t1: dict,
+                       dt: float = 1.0,
+                       threshold: float = 0.05) -> float:
+    """
+    Physics compliance metric:
+      Fraction of samples where relative mass-balance error > threshold.
+
+    Returns float in [0, 1] — 0 = fully physics-compliant, 1 = all violating.
+    """
+    if "X" not in latent_t0 or "S" not in latent_t0:
+        return 0.0
+    X0 = F.softplus(latent_t0["X"])
+    S0 = F.softplus(latent_t0["S"])
+    X1 = F.softplus(latent_t1["X"])
+    mu = _monod_rate(S0)
+    dX_obs  = (X1 - X0) / (dt + 1e-8)
+    dX_pred = mu * X0 - K_D * X0
+    rel_err = torch.abs(dX_obs - dX_pred) / (torch.abs(dX_pred) + 1e-8)
+    return float((rel_err > threshold).float().mean().item())
+
+
+@torch.no_grad()
+def log_residuals(latent_t0: dict, latent_t1: dict,
+                  dt: float = 1.0) -> dict:
+    """
+    Mean absolute physics residuals for training diagnostics.
+    These values should decrease during training.
+    """
+    if "X" not in latent_t0 or "S" not in latent_t0:
+        return {"mean_dX_residual": 0.0, "mean_dS_residual": 0.0}
+    X0 = F.softplus(latent_t0["X"]); S0 = F.softplus(latent_t0["S"])
+    X1 = F.softplus(latent_t1["X"]); S1 = F.softplus(latent_t1["S"])
+    mu = _monod_rate(S0)
+    dX_obs  = (X1 - X0) / (dt + 1e-8)
+    dS_obs  = (S1 - S0) / (dt + 1e-8)
+    dX_pred = mu * X0 - K_D * X0
+    dS_pred = -(1.0 / Y) * mu * X0
+    return {
+        "mean_dX_residual": float(torch.abs(dX_obs - dX_pred).mean().item()),
+        "mean_dS_residual": float(torch.abs(dS_obs - dS_pred).mean().item()),
+    }
+
 
 # ─── 4. VFA / Acetoclastic Mass Balance ───────────────────────────────────────
 
@@ -145,8 +188,8 @@ class VFAMassBalance(nn.Module):
     def forward(self, vfa_t0: torch.Tensor,
                        vfa_t1: torch.Tensor,
                        dt: float = 1.0) -> torch.Tensor:
-        vfa_t0 = F.relu(vfa_t0)
-        vfa_t1 = F.relu(vfa_t1)
+        vfa_t0 = F.softplus(vfa_t0)   # smooth non-negativity (v4)
+        vfa_t1 = F.softplus(vfa_t1)
         dVFA_obs  = (vfa_t1 - vfa_t0) / (dt + 1e-8)
         dVFA_pred = -self.K_ACE * vfa_t0
         return F.mse_loss(dVFA_pred, dVFA_obs)
@@ -215,33 +258,34 @@ class PhysicsInformedLoss(nn.Module):
                 latent_states: dict,
                 sensor_batch:  dict = None,
                 dt:            float = 1.0,
-                weight:        float = 1.0) -> torch.Tensor:
+                weight:        float = 1.0,
+                return_diagnostics: bool = False):
         """
-        latent_states : {
-            't0': {'X': Tensor(B,), 'S': Tensor(B,), 'VFA': Tensor(B,)},
-            't1': {'X': Tensor(B,), 'S': Tensor(B,), 'VFA': Tensor(B,)},
-        }
-        sensor_batch  : raw sensor dict (optional, for thermodynamic loss)
-        weight        : physics residual weight from scheduler
+        latent_states : {'t0': {'X','S','VFA'}, 't1': {'X','S','VFA'}}
+        weight             : physics residual weight (0→1) from scheduler
+        return_diagnostics : if True, returns (loss, diag_dict) instead of loss
         """
+        diag = {"compliance_pct": 0.0, "mean_dX_residual": 0.0, "mean_dS_residual": 0.0}
+
         if weight <= 0.0:
             device = next(iter(latent_states.get("t0",
                           {None: torch.zeros(1)}).values())).device
-            return torch.zeros(1, device=device).squeeze()
+            zero_l = torch.zeros(1, device=device).squeeze()
+            return (zero_l, diag) if return_diagnostics else zero_l
 
         loss = torch.zeros(1).squeeze()
 
         # ── ODE residuals on latent states ─────────────────────────────────
         if "t0" in latent_states and "t1" in latent_states:
-            loss = loss + self.w_ode * self.ode_residuals(
-                latent_states["t0"], latent_states["t1"], dt
-            )
-            # VFA balance
-            if "VFA" in latent_states["t0"] and "VFA" in latent_states["t1"]:
-                loss = loss + self.w_vfa * self.vfa_balance(
-                    latent_states["t0"]["VFA"],
-                    latent_states["t1"]["VFA"], dt
-                )
+            t0, t1 = latent_states["t0"], latent_states["t1"]
+            loss = loss + self.w_ode * self.ode_residuals(t0, t1, dt)
+            if "VFA" in t0 and "VFA" in t1:
+                loss = loss + self.w_vfa * self.vfa_balance(t0["VFA"], t1["VFA"], dt)
+            if return_diagnostics:
+                diag["compliance_pct"]   = compute_compliance(t0, t1, dt)
+                res = log_residuals(t0, t1, dt)
+                diag["mean_dX_residual"] = res["mean_dX_residual"]
+                diag["mean_dS_residual"] = res["mean_dS_residual"]
 
         # ── Thermodynamic feasibility (optional sensor data) ────────────────
         if sensor_batch is not None:
@@ -253,7 +297,8 @@ class PhysicsInformedLoss(nn.Module):
                     sb["ch4_partial"], sb["co2_partial"]
                 )
 
-        return weight * loss
+        weighted_loss = weight * loss
+        return (weighted_loss, diag) if return_diagnostics else weighted_loss
 
 
 # ─── 7. Sensor-to-SI Batch Builder ────────────────────────────────────────────
