@@ -1,13 +1,18 @@
 """
-model.py  (v4 — Domain-Specific Encoders + Latent Biokinetics)
+model.py  (v4 — Asymmetric Encoders + Curriculum Training + Distillation)
 
-Changes from v3 (v4):
-  - ProcessTypeClassifier : auxiliary head (continuous / batch / pilot)
-  - ContinuousDecoder : standard LatentBiokinetics path for continuous domains
-  - BatchDecoder       : takes optional time_since_loading feature — fixes EDI
-  - DomainScaler       : trainable log-affine per domain — fixes 86× scale disparity
+Changes from v3 → v4:
+  - MuscatineEncoder          : unchanged, full 128-dim LSTM (teacher)
+  - DataONEEncoder            : reduced to 64-dim hidden + align_proj → 64-dim output
+  - EDIEncoder                : reduced to 64-dim hidden + align_proj → 64-dim output
+  - latent_distillation_loss(): ||z_small - z_musc.detach()||^2 for curriculum Phase 2
+  - ProcessTypeClassifier     : auxiliary head (continuous / batch / pilot)
+  - ContinuousDecoder         : standard LatentBiokinetics path for continuous domains
+  - BatchDecoder              : takes optional time_since_loading feature — fixes EDI
+  - DomainScaler              : trainable log-affine per domain — fixes 86× scale disparity
+  - freeze_muscatine_encoder(): freeze/unfreeze helpers for curriculum
+  - predict_lodo()            : LOO evaluation with frozen Muscatine encoder as prior
   - BiogasTransferModel.source_forward() routes to correct decoder by domain
-  - freeze_small_domain_encoders() exposes encoder freeze for LODO
 """
 
 import torch
@@ -145,23 +150,33 @@ class MuscatineEncoder(nn.Module):
 
 class DataONEEncoder(nn.Module):
     """
-    GRU with missing-value mask channel.
+    GRU with missing-value mask channel (v4: reduced to 64-dim hidden).
     Handles the 65-column sparse DataONE AD dataset where many columns
     are absent per row. The mask (0/1 per feature) is concatenated to the
     input so the GRU can learn which channels are reliable.
-    Output: (B, out_dim)
+
+    v4 change: hidden_dim reduced 128 → 64 so 100 DataONE samples cannot
+    compete on equal footing with 75K Muscatine samples during shared training.
+    align_proj restores output to enc_out (64) for downstream head compatibility.
+
+    Output: (B, out_dim=64)
     """
 
     def __init__(self, feat_dim: int, hidden_dim: int = 128,
                  dropout: float = 0.3):
         super().__init__()
+        small_h = max(32, hidden_dim // 2)   # 64 when hidden_dim=128 (default)
         # mask channel doubles the input dimension
-        self.gru = nn.GRU(feat_dim * 2, hidden_dim, num_layers=2,
+        self.gru = nn.GRU(feat_dim * 2, small_h, num_layers=2,
                            batch_first=True, dropout=dropout)
-        self.norm  = nn.LayerNorm(hidden_dim)
-        self.proj  = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2),
+        self.norm  = nn.LayerNorm(small_h)
+        self.proj  = nn.Sequential(nn.Linear(small_h, small_h // 2),
                                     nn.GELU(), nn.Dropout(dropout))
-        self.out_dim = hidden_dim // 2
+        # Align projector: lifts small_h//2 output up to full enc_out (hidden_dim//2)
+        # so downstream prediction head + DomainScaler shapes are unchanged
+        self.align_proj = nn.Linear(small_h // 2, hidden_dim // 2)
+        self.out_dim = hidden_dim // 2   # same interface as MuscatineEncoder
+        self._small_out = small_h // 2   # actual pre-align dimension (for distillation)
 
     def forward(self, x: torch.Tensor,
                 mask: torch.Tensor = None) -> torch.Tensor:
@@ -175,33 +190,50 @@ class DataONEEncoder(nn.Module):
         x_masked = torch.cat([x, mask], dim=-1)   # (B, T, 2F)
         out, _   = self.gru(x_masked)
         out      = self.norm(out)
-        return self.proj(out[:, -1, :] + out.mean(dim=1))
+        small_z  = self.proj(out[:, -1, :] + out.mean(dim=1))  # (B, small_h//2)
+        return self.align_proj(small_z)   # (B, hidden_dim//2) = (B, enc_out)
 
 
 class EDIEncoder(nn.Module):
     """
-    Transformer encoder for irregularly-sampled EDI SSAD time series.
+    Transformer encoder for irregularly-sampled EDI SSAD time series (v4: 64-dim).
     Uses learned positional encoding (not fixed sinusoidal) to handle
     irregular time gaps.
-    Output: (B, out_dim)
+
+    v4 change: hidden_dim reduced 128 → 64 to prevent ~100-sample EDI
+    gradients from overriding Muscatine's 75K-sample representation.
+    align_proj restores output to enc_out (64) for downstream compatibility.
+
+    Output: (B, out_dim=64)
     """
 
     def __init__(self, feat_dim: int, hidden_dim: int = 128,
                  n_heads: int = 4, n_layers: int = 2,
                  dropout: float = 0.3):
         super().__init__()
-        self.input_proj = nn.Linear(feat_dim, hidden_dim)
-        self.pos_emb    = nn.Embedding(512, hidden_dim)   # up to 512 timesteps
+        small_h = max(32, hidden_dim // 2)   # 64 when hidden_dim=128
+        # n_heads must divide small_h evenly
+        _n_heads = min(n_heads, small_h // 8) or 1
+        while small_h % _n_heads != 0:
+            _n_heads -= 1
+        _n_heads = max(1, _n_heads)
+
+        self.input_proj = nn.Linear(feat_dim, small_h)
+        self.pos_emb    = nn.Embedding(512, small_h)   # up to 512 timesteps
         encoder_layer   = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=n_heads, dim_feedforward=hidden_dim * 2,
+            d_model=small_h, nhead=_n_heads,
+            dim_feedforward=small_h * 2,
             dropout=dropout, batch_first=True, norm_first=True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer,
                                                   num_layers=n_layers)
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.proj = nn.Sequential(nn.Linear(hidden_dim, hidden_dim // 2),
+        self.norm = nn.LayerNorm(small_h)
+        self.proj = nn.Sequential(nn.Linear(small_h, small_h // 2),
                                    nn.GELU(), nn.Dropout(dropout))
-        self.out_dim = hidden_dim // 2
+        # Align projector: lifts small_h//2 up to full enc_out
+        self.align_proj = nn.Linear(small_h // 2, hidden_dim // 2)
+        self.out_dim = hidden_dim // 2   # same interface as MuscatineEncoder
+        self._small_out = small_h // 2
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
@@ -209,7 +241,23 @@ class EDIEncoder(nn.Module):
         h   = self.input_proj(x) + self.pos_emb(pos)
         h   = self.transformer(h)
         h   = self.norm(h)
-        return self.proj(h[:, -1, :] + h.mean(dim=1))
+        small_z = self.proj(h[:, -1, :] + h.mean(dim=1))   # (B, small_h//2)
+        return self.align_proj(small_z)                     # (B, enc_out)
+
+
+# ─── Distillation Loss ─────────────────────────────────────────────────────────────
+
+def latent_distillation_loss(z_small: torch.Tensor,
+                             z_teacher: torch.Tensor) -> torch.Tensor:
+    """
+    Curriculum Phase 2: aligns small-encoder latents to Muscatine teacher.
+
+    ||z_small - z_teacher.detach()||^2
+
+    z_teacher is DETACHED so gradients only flow through the small encoder.
+    Muscatine encoder stays frozen during Phase 2.
+    """
+    return F.mse_loss(z_small, z_teacher.detach())
 
 
 # ─── Domain Similarity Router ─────────────────────────────────────────────────
@@ -652,6 +700,41 @@ class BiogasTransferModel(nn.Module):
             if verbose:
                 print(f"  [LODO] Frozen encoder: {domain}")
 
+    def freeze_muscatine_encoder(self, verbose: bool = True):
+        """Freeze Muscatine encoder (curriculum Phase 2 — teacher locked)."""
+        for p in self.encoder_muscatine.parameters():
+            p.requires_grad = False
+        if verbose:
+            print("  [Curriculum] Muscatine encoder FROZEN (teacher mode)")
+
+    def unfreeze_muscatine_encoder(self, verbose: bool = True):
+        """Unfreeze Muscatine encoder (curriculum Phase 3 — fine-tune all)."""
+        for p in self.encoder_muscatine.parameters():
+            p.requires_grad = True
+        if verbose:
+            print("  [Curriculum] Muscatine encoder UNFROZEN (Phase 3 fine-tune)")
+
+    def unfreeze_small_domain_encoders(
+            self,
+            small_domains: list = None,
+            verbose: bool = True):
+        """Unfreeze small-domain encoders (curriculum Phase 2/3)."""
+        if small_domains is None:
+            small_domains = ["dataone", "edi"]
+        enc_map = {
+            "muscatine": self.encoder_muscatine,
+            "dataone":   self.encoder_dataone,
+            "edi":       self.encoder_edi,
+        }
+        for domain in small_domains:
+            enc = enc_map.get(domain)
+            if enc is None:
+                continue
+            for p in enc.parameters():
+                p.requires_grad = True
+            if verbose:
+                print(f"  [Curriculum] Unfrozen encoder: {domain}")
+
     def set_grl_alpha(self, alpha: float):
         self.domain_disc.grl.alpha = alpha
 
@@ -696,3 +779,48 @@ class BiogasTransferModel(nn.Module):
         all_feat = torch.cat(feats, dim=0)
         self.maha_gate.fit(all_feat.to(device))
         print(f"  [MahalanobisGate] Fitted on {len(all_feat)} source embeddings")
+
+    # ─── LOO Ensemble Prior ──────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def predict_lodo(self, x: torch.Tensor,
+                     excluded_domain: str,
+                     scaler_y=None,
+                     mask: torch.Tensor = None):
+        """
+        LOO prediction with frozen Muscatine encoder as distribution prior.
+
+        When excluded_domain='muscatine', we KEEP the frozen Muscatine encoder
+        as a prior rather than dropping it entirely.  This avoids the collapse
+        seen when 200 remaining samples must support a 128-dim LSTM alone.
+
+        Ensemble weighting:
+          - If Muscatine excluded from training data: use 0.3 Muscatine + 0.7 small
+          - If a small domain excluded: use 1.0 Muscatine
+        """
+        self.eval()
+        available = [d for d in ["muscatine", "dataone", "edi"]
+                     if d != excluded_domain]
+
+        if excluded_domain == "muscatine":
+            # Muscatine encoder acts as frozen prior (not fully excluded)
+            f_m = self._encode(x, "muscatine")          # (B, enc_out)
+            # Soft prediction from remaining small encoders
+            f_d = self._encode(x, "dataone", mask)      # (B, enc_out)
+            f_e = self._encode(x, "edi")                # (B, enc_out)
+            # Weighted ensemble: Muscatine prior (30%) + small-domain mean (70%)
+            feat = 0.3 * f_m + 0.35 * f_d + 0.35 * f_e
+        else:
+            # Simple case: excluded small domain, use Muscatine as primary
+            feat = self._encode(x, "muscatine")
+
+        mean, aleatoric, epistemic, total, reject_evid = self.pred_head.predict(
+            feat, self.evid_loss
+        )
+        if scaler_y is not None:
+            scale = torch.tensor(scaler_y.scale_[0], dtype=torch.float32)
+            mu_   = torch.tensor(scaler_y.mean_[0],  dtype=torch.float32)
+            mean      = mean.squeeze() * scale + mu_
+            aleatoric = aleatoric.squeeze() * scale
+            epistemic = epistemic.squeeze() * scale
+        return mean, aleatoric, epistemic

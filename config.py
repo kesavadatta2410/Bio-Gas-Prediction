@@ -46,6 +46,13 @@ MODEL = {
     "num_mc_samples": 30,
 }
 
+# Asymmetric encoder capacity (v4): small domains use smaller hidden dim
+# to prevent 100-sample DataONE/EDI from competing with 75K-sample Muscatine
+SMALL_DOMAIN_HIDDEN = 64   # DataONE + EDI encoder hidden_dim
+
+# Distillation loss weight: how strongly small encoders align to Muscatine latents
+DISTILLATION_WEIGHT = 0.5
+
 # ─── Process Types ────────────────────────────────────────────────────────────
 PROCESS_TYPE = {"continuous": 0, "batch": 1, "pilot": 2}
 DOMAIN_PROCESS_MAP = {"muscatine": "continuous", "dataone": "pilot", "edi": "batch"}
@@ -69,22 +76,22 @@ UNIT_CONVERSION = {
 
 # ─── Training ─────────────────────────────────────────────────────────────────
 TRAIN = {
-    "source_epochs":  20,
+    "source_epochs":  120,    # total across all 3 phases (v4)
     "adapt_epochs":   50,
     "batch_size":     64,
     "lr":             1e-3,
     "weight_decay":   1e-4,
     "lambda_mmd":     0.1,
     "lambda_adv":     0.1,
-    "patience":       15,
+    "patience":       20,
     "val_split":      0.15,
     "test_split":     0.15,
     "seq_len":        48,      # ≥48 h for continuous (2× HRT); full batch for EDI
-    # Per-domain learning rates (small domains need higher LR to learn from few samples)
+    # Per-domain LRs — keys match actual model param name prefixes (v4 fix)
     "lr_per_domain": {
-        "muscatine": 1e-4,
-        "dataone":   1e-3,
-        "edi":       1e-3,
+        "encoder_muscatine": 1e-5,   # low LR to preserve Phase-1 learnt repr
+        "encoder_dataone":   1e-3,   # higher LR for small domains in Phase 3
+        "encoder_edi":       1e-3,
     },
     # Teacher forcing: 1.0 = always use ground truth; decays to 0.0 (autoregressive)
     "teacher_forcing_init":  1.0,
@@ -93,6 +100,20 @@ TRAIN = {
     "predict_delta":         False,   # set True to enable stationary targets
     # Sequence length minimums
     "seq_len_min_continuous": 48,    # 2 × typical HRT (hours)
+}
+
+# ─── Curriculum Training (v4) ──────────────────────────────────────────────────
+# Phases split across source_epochs total.
+# Phase 1: Muscatine-only (establish solid base representation)
+# Phase 2: Frozen Muscatine teacher + small-domain distillation
+# Phase 3: All unfrozen with graduated per-domain LR
+CURRICULUM = {
+    "phase1_epochs": 50,    # Muscatine only — small encoders frozen
+    "phase2_epochs": 30,    # Small domains distill from frozen Muscatine teacher
+    "phase3_epochs": 40,    # All unfrozen, graduated LR
+    "phase2_small_lr": 1e-3,   # LR for small encoders during distillation
+    "phase3_muscatine_lr": 1e-5,  # Fine-tune LR for Muscatine (preserve repr)
+    "phase3_small_lr": 1e-3,
 }
 
 # ─── Physics Constraints ──────────────────────────────────────────────────────

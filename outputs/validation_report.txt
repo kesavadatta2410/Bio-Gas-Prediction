@@ -1,0 +1,27 @@
+======================================================================
+  BIOGAS TRANSFER LEARNING — VALIDATION REPORT  (v3)
+======================================================================
+
+── Per-Domain Metrics (before averaging) ─────────────────────────
+  muscatine        R²=+0.8360  RMSE=25.0957  MAE=18.8343
+  dataone          R²=+0.0112  RMSE=0.2929  MAE=0.2373
+  edi_ssad         R²=-0.2033  RMSE=0.3225  MAE=0.2703
+
+── Temporal-Block Cross-Validation (5-fold, per-dataset) ──────────
+  muscatine       RMSE=0.3458±0.0255  R²=0.8801±0.0173
+
+── Leave-One-Dataset-Out ──────────────────────────────────────────
+  Left out 'muscatine':  RMSE=0.9914  R²=0.0172
+  Left out 'dataone':  RMSE=0.3435  R²=-0.4170
+  Left out 'edi_ssad':  RMSE=0.3478  R²=-0.4422
+
+── Backtest Drift Summary ─────────────────────────────────────────
+  Initial RMSE : 14.0980
+  Final RMSE   : 14.1602
+  Drift        : +0.0622
+
+── Diagnostics ────────────────────────────────────────────────────
+  Prediction variance : 0.482415  ✓ OK
+  Mean |residual|     : 0.2601
+
+======================================================================

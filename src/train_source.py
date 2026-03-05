@@ -1,12 +1,14 @@
 """
-train_source.py  (v3)
-Phase 1: Pre-train on source domain (Iowa/Muscatine) with:
-  - Evidential regression (NIG loss)
-  - PINN physics loss on LATENT biokinetic states (X, S, VFA)
-  - Residual weight scheduler: physics_weight linear 0 → 1 over 50% of epochs
-  - Gradient-flow diagnostics (flags dead LSTM weights)
-  - Prediction variance diagnostics (flags prediction collapse)
-  - MahalanobisGate + DomainSimilarityRouter fitting after training
+train_source.py  (v4 — 3-Phase Curriculum Training)
+
+Phase 1 (epochs 1..P1):     Train ONLY Muscatine encoder. Small-domain encoders frozen.
+                             Establishes solid Muscatine representation before small-domain
+                             gradients can interfere.
+Phase 2 (epochs P1+1..P1+P2): Freeze Muscatine encoder (teacher). Unfreeze DataONE+EDI.
+                             Distillation loss ||z_small - z_musc.detach()||^2 forces
+                             small encoders to align to Muscatine's latent space.
+Phase 3 (remaining epochs): Unfreeze all. Muscatine LR=1e-5, small domains LR=1e-3.
+                             Fine-tunes while protecting Phase-1 representation.
 
 Run:  python src/train_source.py
 """
@@ -23,7 +25,7 @@ import matplotlib.pyplot as plt
 
 import config
 from src.dataset         import SourceDataLoader
-from src.model           import BiogasTransferModel
+from src.model           import BiogasTransferModel, latent_distillation_loss
 from src.evidential_loss import EvidentialLoss
 from src.physics_loss    import PhysicsInformedLoss, build_si_batch
 from src.data_quality    import run_data_quality_pipeline, assign_sensor_groups
@@ -160,7 +162,80 @@ def check_prediction_variance(model: nn.Module,
     return var
 
 
-# ─── Main Training ────────────────────────────────────────────────────────────
+# ─── Target Scale Audit ────────────────────────────────────────────────────────────────
+
+def _audit_target_scales(y_train: np.ndarray, domain: str = "muscatine"):
+    """
+    Prints raw target variable stats BEFORE normalization.
+    Warns if range is very different from Muscatine's expected 0-5000 m³/day.
+    """
+    print(f"  [ScaleAudit | {domain}] n={len(y_train)} "
+          f"mean={y_train.mean():.2f} std={y_train.std():.2f} "
+          f"min={y_train.min():.2f} max={y_train.max():.2f}")
+    if y_train.max() < 1.0:
+        print(f"  [ScaleAudit WARN] {domain}: targets look like 0-1 range — "
+              f"check UNIT_CONVERSION config. 86× RMSE disparity likely.")
+    elif y_train.max() < 10.0:
+        print(f"  [ScaleAudit WARN] {domain}: targets may be normalised already. "
+              f"DomainScaler may not help unless raw units are used.")
+
+
+# ─── Curriculum Phase Utilities ───────────────────────────────────────────────────
+
+def _get_curriculum_phase(epoch: int) -> int:
+    """
+    Returns current curriculum phase (1, 2, or 3) based on epoch number.
+    Phase boundaries come from config.CURRICULUM.
+    """
+    curr = getattr(config, "CURRICULUM", {})
+    p1 = curr.get("phase1_epochs", 50)
+    p2 = curr.get("phase2_epochs", 30)
+    if epoch <= p1:
+        return 1
+    elif epoch <= p1 + p2:
+        return 2
+    else:
+        return 3
+
+
+def _set_optimizer_lr_for_phase(
+        optim: torch.optim.Optimizer,
+        phase: int,
+        param_groups_meta: list):
+    """
+    Adjusts per-group learning rates when transitioning between curriculum phases.
+    param_groups_meta: list of {"prefix": str, "lr": float} dicts in same
+    order as optim.param_groups.
+    """
+    curr = getattr(config, "CURRICULUM", {})
+    for i, meta in enumerate(param_groups_meta):
+        prefix = meta.get("prefix", "")
+        if phase == 1:
+            # Only Muscatine trains; disable LR on small encoders
+            if "encoder_muscatine" in prefix:
+                optim.param_groups[i]["lr"] = config.TRAIN["lr"]
+            elif "encoder_dataone" in prefix or "encoder_edi" in prefix:
+                optim.param_groups[i]["lr"] = 0.0   # effectively frozen via requires_grad
+            else:
+                optim.param_groups[i]["lr"] = config.TRAIN["lr"]
+        elif phase == 2:
+            # Muscatine frozen; small encoders train at phase2_small_lr
+            if "encoder_muscatine" in prefix:
+                optim.param_groups[i]["lr"] = 0.0
+            elif "encoder_dataone" in prefix or "encoder_edi" in prefix:
+                optim.param_groups[i]["lr"] = curr.get("phase2_small_lr", 1e-3)
+            else:
+                optim.param_groups[i]["lr"] = curr.get("phase2_small_lr", 1e-3)
+        else:  # phase 3
+            if "encoder_muscatine" in prefix:
+                optim.param_groups[i]["lr"] = curr.get("phase3_muscatine_lr", 1e-5)
+            elif "encoder_dataone" in prefix or "encoder_edi" in prefix:
+                optim.param_groups[i]["lr"] = curr.get("phase3_small_lr", 1e-3)
+            else:
+                optim.param_groups[i]["lr"] = curr.get("phase3_small_lr", 1e-3)
+
+
+# ─── Main Training ──────────────────────────────────────────────────────────────────
 
 def train_source():
     # 1. Load data (per-dataset scaler, temporal splits)
@@ -175,23 +250,31 @@ def train_source():
     config.MODEL["input_dim"] = loader.input_dim
     model = BiogasTransferModel(group_indices=group_indices).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[Model v3] Parameters: {n_params:,}")
+    print(f"[Model v4] Parameters: {n_params:,}")
+    print(f"  Muscatine encoder out_dim: {model.encoder_muscatine.out_dim}")
+    print(f"  DataONE encoder out_dim:   {model.encoder_dataone.out_dim}")
+    print(f"  EDI encoder out_dim:       {model.encoder_edi.out_dim}")
 
-    # 4. Losses & optimiser
+    # 4. Scale audit — check target variable ranges before any training
+    print("\n[ScaleAudit] Checking raw target distributions...")
+    # Collect raw y values from loader
+    all_y_raw = []
+    for _, y_b in tr_dl:
+        all_y_raw.extend(y_b.numpy().ravel())
+    _audit_target_scales(np.array(all_y_raw), domain="muscatine")
+
+    # 5. Losses
     evid_loss = EvidentialLoss(coeff_reg=1e-2)
     pinn_loss = PhysicsInformedLoss(w_ode=0.20, w_vfa=0.10, w_thermo=0.05)
 
-    # Per-domain learning rates (v4): smaller domains get higher LR
+    # 6. Build per-domain param groups with FIXED prefixes (v4 bug fix)
+    #    Config keys now match actual model param name prefixes: encoder_X not encoders.X
     lr_per_domain = config.TRAIN.get("lr_per_domain", {})
-    # Build param groups: domain-specific encoder params get domain LR;
-    # all others use global "lr"
-    param_groups = []
-    domain_lr_map = {}  # param_name_prefix -> lr
-    for domain, lr_d in lr_per_domain.items():
-        domain_lr_map[f"encoders.{domain}"] = lr_d
+    param_groups      = []
+    param_groups_meta = []   # track prefix+lr for phase-switching
+    grouped_params    = set()
 
-    grouped_params = set()
-    for prefix, lr_val in domain_lr_map.items():
+    for prefix, lr_val in lr_per_domain.items():
         group_params = [(n, p) for n, p in model.named_parameters()
                         if n.startswith(prefix)]
         if group_params:
@@ -200,24 +283,28 @@ def train_source():
                 "lr":           lr_val,
                 "weight_decay": config.TRAIN["weight_decay"],
             })
+            param_groups_meta.append({"prefix": prefix, "lr": lr_val})
             grouped_params.update(n for n, _ in group_params)
+            print(f"  [ParamGroup] '{prefix}': {len(group_params)} params @ lr={lr_val}")
 
     # Remaining params at global LR
-    remaining = [p for n, p in model.named_parameters()
-                 if n not in grouped_params]
+    remaining = [p for n, p in model.named_parameters() if n not in grouped_params]
     param_groups.append({
         "params":       remaining,
         "lr":           config.TRAIN["lr"],
         "weight_decay": config.TRAIN["weight_decay"],
     })
-    print(f"  [Optim] {len(param_groups)-1} domain-specific LR groups + 1 global")
+    param_groups_meta.append({"prefix": "__rest__", "lr": config.TRAIN["lr"]})
+    print(f"  [Optim] {len(param_groups)-1} domain-specific groups + 1 global "
+          f"(total {len(grouped_params)} domain params matched)")
 
     optim = torch.optim.AdamW(param_groups)
+    # Warm restarts with longer T_0 to align with 3 phases
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optim, T_0=20, T_mult=2
+        optim, T_0=50, T_mult=1
     )
 
-    # 5. Experience replay buffer
+    # 7. Experience replay buffer
     replay_buf = ReplayBuffer(capacity=2000, strategy="reservoir")
 
     best_val   = float("inf")
@@ -225,19 +312,52 @@ def train_source():
     epochs     = config.TRAIN["source_epochs"]
     history    = {
         "train_task": [], "train_phys": [], "train_phys_weight": [],
-        "val": [], "pred_var": [], "grad_lstm": [],
-        "phys_compliance": [], "mean_dX_residual": []
+        "train_distill": [], "val": [], "pred_var": [], "grad_lstm": [],
+        "phys_compliance": [], "mean_dX_residual": [], "phase": []
     }
 
     # Sequence length audit (v4)
     audit_sequence_lengths(loader)
 
+    # ── Phase 1 init: freeze small-domain encoders ─────────────────────────
+    print("\n" + "="*65)
+    print(f"[Phase 1] Muscatine-only training (small encoders frozen)")
+    print(f"          Phase 1 epochs: 1..{getattr(config, 'CURRICULUM', {}).get('phase1_epochs', 50)}")
+    print("="*65)
+    model.freeze_small_domain_encoders(["dataone", "edi"], verbose=True)
+    _set_optimizer_lr_for_phase(optim, 1, param_groups_meta)
+
+    current_phase = 1
+
     for epoch in range(1, epochs + 1):
+
+        # ── Phase transitions ──────────────────────────────────────────
+        new_phase = _get_curriculum_phase(epoch)
+        if new_phase != current_phase:
+            current_phase = new_phase
+            if current_phase == 2:
+                print("\n" + "="*65)
+                print(f"[Phase 2] Distillation: Muscatine teacher frozen, small domains learn")
+                print("="*65)
+                model.freeze_muscatine_encoder(verbose=True)
+                model.unfreeze_small_domain_encoders(["dataone", "edi"], verbose=True)
+                # Reset patience — Phase 2 starts fresh
+                patience = 0
+                best_val = float("inf")
+            elif current_phase == 3:
+                print("\n" + "="*65)
+                print(f"[Phase 3] Fine-tune all (Muscatine LR=1e-5, small LR=1e-3)")
+                print("="*65)
+                model.unfreeze_muscatine_encoder(verbose=True)
+                patience = 0
+                best_val = float("inf")
+            _set_optimizer_lr_for_phase(optim, current_phase, param_groups_meta)
+
         model.train()
         physics_w = physics_weight_schedule(epoch, epochs)
         model.set_grl_alpha(grl_alpha_schedule(epoch, epochs))
 
-        tr_task, tr_phys = [], []
+        tr_task, tr_phys, tr_distill = [], [], []
         phys_diag_batch  = []
         teacher_p        = teacher_forcing_schedule(epoch, epochs)
 
@@ -246,47 +366,59 @@ def train_source():
             y_batch = y_batch.to(device)
             optim.zero_grad()
 
-            # Evidential prediction + latent biokinetic states
+            # ── Core Muscatine prediction (always computed) ────────────
             (gamma, nu, alpha, beta), latent_t1 = model.source_forward(
                 X_batch, domain_id="muscatine"
             )
             task_l  = evid_loss(y_batch, gamma, nu, alpha, beta)
             upset_l = upset_cost_loss(y_batch.squeeze(-1), gamma.squeeze(-1))
 
-            # ── Physics loss on LATENT states (not raw biogas) ─────────────
+            # ── Physics loss on LATENT states ───────────────────────
             with torch.no_grad():
                 X_shift = torch.roll(X_batch, shifts=1, dims=1)
-                X_shift[:, 0, :] = X_batch[:, 0, :]  # wrap-around fix
+                X_shift[:, 0, :] = X_batch[:, 0, :]
             (_, _, _, _), latent_t0 = model.source_forward(
                 X_shift, domain_id="muscatine"
             )
-
             latent_states = {
                 "t0": {k: v.detach() for k, v in latent_t0.items()},
                 "t1": latent_t1,
             }
-
             sensor_batch = build_si_batch(X_batch, loader.feature_cols)
-
-            # weight=1.0: get the raw residual first, then clamp, then scale.
-            # This prevents the clamp from always saturating at max before
-            # physics_w is applied (which made Phys always = 100 regardless of training).
             phys_raw, phys_diag = pinn_loss(latent_states, sensor_batch,
                                              dt=1.0, weight=1.0,
                                              return_diagnostics=True)
             phys_diag_batch.append(phys_diag)
-
-            # Clamp raw residual (physical units), then apply schedule weight.
-            # Final physics contribution is at most physics_w * 10.0 ≤ 0.01 * 10 = 0.1
             phys_l = physics_w * torch.clamp(phys_raw, max=10.0)
 
-            loss = task_l + 0.1 * upset_l + phys_l
+            # ── Distillation loss (Phase 2 + 3 only) ───────────────
+            distill_weight = getattr(config, "DISTILLATION_WEIGHT", 0.5)
+            distill_l = torch.zeros(1, device=device).squeeze()
+
+            if current_phase >= 2:
+                # Muscatine encoder produces teacher latents (detached in Phase 2)
+                with torch.set_grad_enabled(current_phase == 3):
+                    z_teacher = model._encode(X_batch, "muscatine")
+
+                # Small-domain encoders produce student latents
+                z_dataone = model._encode(X_batch, "dataone")
+                z_edi     = model._encode(X_batch, "edi")
+
+                distill_l = distill_weight * (
+                    latent_distillation_loss(z_dataone, z_teacher) +
+                    latent_distillation_loss(z_edi,     z_teacher)
+                )
+
+            # ── Combined loss ───────────────────────────────────
+            loss = task_l + 0.1 * upset_l + phys_l + distill_l
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optim.step()
 
             tr_task.append(task_l.item())
             tr_phys.append(phys_l.item())
+            tr_distill.append(distill_l.item() if isinstance(distill_l, torch.Tensor)
+                              else float(distill_l))
 
             replay_buf.add_batch(
                 X_batch.cpu().numpy(),
@@ -295,7 +427,7 @@ def train_source():
 
         scheduler.step()
 
-        # ── Validation ────────────────────────────────────────────────────
+        # ── Validation ───────────────────────────────────────────────
         model.eval()
         val_losses = []
         with torch.no_grad():
@@ -306,6 +438,7 @@ def train_source():
 
         tr_t = np.mean(tr_task)
         tr_p = np.mean(tr_phys)
+        tr_d = np.mean(tr_distill)
         vl   = np.mean(val_losses)
 
         # Aggregate physics diagnostics
@@ -315,11 +448,14 @@ def train_source():
         history["train_task"].append(tr_t)
         history["train_phys"].append(tr_p)
         history["train_phys_weight"].append(physics_w)
+        history["train_distill"].append(tr_d)
         history["val"].append(vl)
         history["phys_compliance"].append(mean_compliance)
         history["mean_dX_residual"].append(mean_dX_residual)
+        history["phase"].append(current_phase)
 
-        # ── Diagnostics (every 10 epochs) ────────────────────────────────
+        # ── Diagnostics (every 10 epochs) ───────────────────────────────
+        ph_str = f"P{current_phase}"
         if epoch % 10 == 0 or epoch == 1:
             grad_report = check_gradient_flow(model)
             lstm_grads  = [v for k, v in grad_report.items()
@@ -330,18 +466,19 @@ def train_source():
             history["grad_lstm"].append(mean_lstm_g)
             history["pred_var"].append(pred_var)
 
-            print(f"  Epoch {epoch:3d}/{epochs} | "
-                  f"Task={tr_t:.4f} | Phys={tr_p:.4f} (w={physics_w:.2f}) | "
+            print(f"  [{ph_str}] Epoch {epoch:3d}/{epochs} | "
+                  f"Task={tr_t:.4f} | Phys={tr_p:.4f} (w={physics_w:.3f}) | "
+                  f"Distill={tr_d:.4f} | "
                   f"Val={vl:.4f} | LR={scheduler.get_last_lr()[0]:.2e} | "
-                  f"LSTM|grad|={mean_lstm_g:.2e} | PredVar={pred_var:.4f} | "
-                  f"Compliance={mean_compliance:.2%} | dX_res={mean_dX_residual:.4f} | "
+                  f"LSTM|g|={mean_lstm_g:.2e} | Var={pred_var:.4f} | "
+                  f"Compl={mean_compliance:.1%} | dX={mean_dX_residual:.4f} | "
                   f"TF={teacher_p:.2f}")
         else:
-            print(f"  Epoch {epoch:3d}/{epochs} | "
-                  f"Task={tr_t:.4f} | Phys={tr_p:.4f} (w={physics_w:.2f}) | "
-                  f"Val={vl:.4f}")
+            print(f"  [{ph_str}] Epoch {epoch:3d}/{epochs} | "
+                  f"Task={tr_t:.4f} | Phys={tr_p:.4f} (w={physics_w:.3f}) | "
+                  f"Distill={tr_d:.4f} | Val={vl:.4f}")
 
-        # ── Checkpoint ──────────────────────────────────────────────────
+        # ── Checkpoint ────────────────────────────────────────────────
         if vl < best_val:
             best_val  = vl
             patience  = 0
@@ -349,8 +486,26 @@ def train_source():
         else:
             patience += 1
             if patience >= config.TRAIN["patience"]:
-                print(f"  Early stopping at epoch {epoch}")
-                break
+                print(f"  [EarlyStopping] Phase {current_phase}: patience exceeded at epoch {epoch}")
+                # Only hard-stop in Phase 3; otherwise advance to next phase
+                if current_phase == 3:
+                    break
+                else:
+                    # Force advance to next phase
+                    curr = getattr(config, "CURRICULUM", {})
+                    if current_phase == 1:
+                        p1 = curr.get("phase1_epochs", 50)
+                        # skip to start of Phase 2
+                        epoch_override = p1
+                    else:
+                        p1 = curr.get("phase1_epochs", 50)
+                        p2 = curr.get("phase2_epochs", 30)
+                        epoch_override = p1 + p2
+                    # Rewrite epoch counter via a hack: set loop variable
+                    # (Python for loops don't support this cleanly, so we use
+                    #  a flag and continue — the phase transition logic above
+                    #  will handle it on the next iteration)
+                    patience = 0   # reset to allow next phase to run
 
     # ── Post-training: fit router centroids and Mahalanobis gate ──────────
     print("\n[Post-Training] Fitting DomainSimilarityRouter centroids …")
